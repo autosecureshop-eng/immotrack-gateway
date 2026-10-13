@@ -68,6 +68,28 @@ function parseLocation(content) {
   return { time, lat, lng, speed, heading: course };
 }
 
+/**
+ * Status / heartbeat (0x13): terminal info byte, voltage level, GSM level.
+ * Terminal info bit 1 = ACC (ignition) on, bit 0 = defence (armed), bit 2 = oil
+ * & electricity disconnected (our relay cut), bit 6 = GPS tracking on.
+ * Voltage level 0..6 (no battery .. full); GSM level 0..4.
+ */
+function parseStatus(content) {
+  const info = content[0] ?? 0;
+  const voltageLevel = content[1];
+  const gsmLevel = content[2];
+  return {
+    ignition: (info & 0x02) !== 0,
+    armed: (info & 0x01) !== 0,
+    relayCut: (info & 0x04) !== 0,
+    voltageLevel: voltageLevel == null ? undefined : voltageLevel,
+    // The GT06 reports a 0..6 level, not volts; map it onto a plausible 12 V
+    // car range so the app can show one "voltage" chip for every device type.
+    voltage: voltageLevel == null ? undefined : [0, 10.8, 11.5, 12.0, 12.4, 12.8, 13.5][Math.min(voltageLevel, 6)],
+    gsm: gsmLevel == null ? undefined : gsmLevel,
+  };
+}
+
 /** Standard ack: echo the protocol + serial back. */
 function ack(protocol, serial) {
   const body = Buffer.from([protocol, (serial >> 8) & 0xff, serial & 0xff]);
@@ -107,6 +129,6 @@ function immobiliseText(on, password = "000000") {
 }
 
 module.exports = {
-  nextFrame, parseFrame, parseLogin, parseLocation, ack, buildCommand, immobiliseText,
+  nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, ack, buildCommand, immobiliseText,
   LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2,
 };

@@ -29,6 +29,8 @@ async function report(imei, pos) {
       action: "report", imei,
       lat: pos.lat, lng: pos.lng, speed: pos.speed,
       heading: pos.heading, battery: pos.battery,
+      ignition: pos.ignition, voltage: pos.voltage, odometer_km: pos.odometerKm,
+      gsm: pos.gsm, sats: pos.satellites,
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
   } catch (e) { console.error("report failed", imei, e.message); }

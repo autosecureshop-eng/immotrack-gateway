@@ -21,6 +21,14 @@ const MOVING_KMH = 3;
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 
+/** Great-circle distance between two fixes, km. */
+function haversineKm(a, b) {
+  const R = 6371, toR = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * toR, dLng = (b.lng - a.lng) * toR;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * toR) * Math.cos(b.lat * toR) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 // ---- apply queued commands to a live session --------------------------------
 
 async function applyCommands(imei, send, dialect, lastSpeed) {
@@ -85,6 +93,12 @@ net.createServer((sock) => {
   let buf = Buffer.alloc(0);
   let imei = null;
   let lastSpeed = null;
+  // GT06 sends ignition/voltage/GSM in its status packet, not with each fix;
+  // remember the latest and attach it to the positions that follow. The GT06
+  // also has no odometer, so distance is integrated here from the fixes.
+  let status = {};
+  let prevFix = null;
+  let odometerKm = null;
   sock.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     try {
@@ -102,11 +116,20 @@ net.createServer((sock) => {
           sock.write(gt.ack(protocol, serial));
           if (imei) {
             const pos = gt.parseLocation(content);
-            if (pos.lat || pos.lng) { lastSpeed = pos.speed; await up.report(imei, pos); }
+            if (pos.lat || pos.lng) {
+              lastSpeed = pos.speed;
+              if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
+              prevFix = pos;
+              await up.report(imei, { ...pos, ...status, odometerKm: odometerKm ?? undefined });
+            }
             await applyCommands(imei, (t) => sock.write(gt.buildCommand(t)), gt, lastSpeed);
           }
+        } else if (protocol === gt.STATUS) {
+          sock.write(gt.ack(protocol, serial));
+          status = gt.parseStatus(content);
+          if (imei) await applyCommands(imei, (t) => sock.write(gt.buildCommand(t)), gt, lastSpeed);
         } else {
-          // heartbeat / status / alarms — ack so the device stays connected.
+          // heartbeat / alarms — ack so the device stays connected.
           sock.write(gt.ack(protocol, serial));
           if (imei) await applyCommands(imei, (t) => sock.write(gt.buildCommand(t)), gt, lastSpeed);
         }

@@ -54,13 +54,26 @@ function parseAvl(buf) {
     const satellites = data[p++];
     const speed = data.readUInt16BE(p); p += 2; // km/h
 
-    // IO element — we skip the values but must walk it to reach the next record.
+    // IO elements: keep the handful the app shows, walk past the rest.
+    const io = {};
+    const readVal = (sz) => {
+      let v;
+      if (sz === 1) v = data[p];
+      else if (sz === 2) v = data.readUInt16BE(p);
+      else if (sz === 4) v = data.readUInt32BE(p);
+      else v = Number(data.readBigUInt64BE(p));
+      p += sz;
+      return v;
+    };
     if (ext) {
       p += 2; // event IO id (2 bytes)
       const totalIo = data.readUInt16BE(p); p += 2; void totalIo;
       for (const sz of [1, 2, 4, 8]) {
         const cnt = data.readUInt16BE(p); p += 2;
-        p += cnt * (2 + sz); // id(2) + value(sz)
+        for (let k = 0; k < cnt; k++) {
+          const id = data.readUInt16BE(p); p += 2;
+          io[id] = readVal(sz);
+        }
       }
       const nx = data.readUInt16BE(p); p += 2;
       for (let k = 0; k < nx; k++) {
@@ -73,10 +86,23 @@ function parseAvl(buf) {
       const totalIo = data[p++]; void totalIo;
       for (const sz of [1, 2, 4, 8]) {
         const cnt = data[p++];
-        p += cnt * (1 + sz); // id(1) + value(sz)
+        for (let k = 0; k < cnt; k++) {
+          const id = data[p++];
+          io[id] = readVal(sz);
+        }
       }
     }
-    records.push({ time, priority, lat, lng, speed, heading, satellites });
+    records.push({
+      time, priority, lat, lng, speed, heading, satellites,
+      // Teltonika AVL IDs (FMB/FMC): 239 ignition, 240 movement, 21 GSM level,
+      // 66 external voltage mV, 67 battery mV, 16 total odometer m, 199 trip odometer m.
+      ignition: io[239] == null ? undefined : io[239] === 1,
+      moving: io[240] == null ? undefined : io[240] === 1,
+      gsm: io[21],
+      voltage: io[66] == null ? undefined : io[66] / 1000,
+      batteryVolts: io[67] == null ? undefined : io[67] / 1000,
+      odometerKm: io[16] == null ? undefined : io[16] / 1000,
+    });
   }
   return { records, count: n, consumed: total };
 }
