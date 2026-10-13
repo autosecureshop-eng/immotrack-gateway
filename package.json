@@ -1,0 +1,12 @@
+{
+  "name": "immostop-tracker-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TCP gateway: GT06 / Teltonika FMB920-FMC920 devices -> IMMOSTOP Supabase tracker API, with remote immobilise.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=18" }
+}
