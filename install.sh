@@ -22,9 +22,15 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y -qq
 apt-get install -y -qq curl git ufw ca-certificates openssl >/dev/null
 
-# Node 20 (Ubuntu's own nodejs package is too old on 22.04).
-if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v\([0-9]*\).*/\1/')" -lt 18 ]; then
-  say "Node.js 20"
+# Node 18+ : the distro package is fine on Debian 12/13 and Ubuntu 24.04; older
+# releases (Ubuntu 22.04 ships Node 12) fall back to NodeSource.
+node_major() { command -v node >/dev/null 2>&1 && node -v | sed 's/v\([0-9]*\).*/\1/' || echo 0; }
+if [ "$(node_major)" -lt 18 ]; then
+  say "Node.js"
+  apt-get install -y -qq nodejs npm >/dev/null 2>&1 || true
+fi
+if [ "$(node_major)" -lt 18 ]; then
+  say "Node.js 20 (NodeSource)"
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
   apt-get install -y -qq nodejs >/dev/null
 fi
@@ -83,11 +89,24 @@ systemctl daemon-reload
 systemctl enable --now ${SERVICE}
 systemctl restart ${SERVICE}
 
-say "Firewall (SSH + tracker ports)"
-ufw allow 22/tcp >/dev/null
-ufw allow 5023/tcp >/dev/null   # GT06 / Concox
-ufw allow 5027/tcp >/dev/null   # Teltonika
-ufw --force enable >/dev/null
+# Firewall. On a box that runs Plesk (its own firewall + ports 8443/80/443) or
+# where ufw isn't already in charge, DON'T switch ufw on — that would lock the
+# owner out of Plesk. Just add the rules if ufw is active; otherwise rely on the
+# provider's firewall policy (Fasthosts/IONOS Cloud Panel → Network → Firewall).
+if [ -d /usr/local/psa ]; then
+  say "Plesk detected — leaving the firewall to Plesk / the Cloud Panel policy"
+  echo "   Make sure TCP 5023 and 5027 are allowed in the provider firewall policy."
+elif ufw status 2>/dev/null | grep -q "Status: active"; then
+  say "Firewall (ufw active): allowing tracker ports"
+  ufw allow 5023/tcp >/dev/null   # GT06 / Concox
+  ufw allow 5027/tcp >/dev/null   # Teltonika
+else
+  say "Firewall (ufw): SSH + tracker ports"
+  ufw allow 22/tcp >/dev/null
+  ufw allow 5023/tcp >/dev/null
+  ufw allow 5027/tcp >/dev/null
+  ufw --force enable >/dev/null
+fi
 
 sleep 1
 IP="$(curl -fsS -4 https://api.ipify.org || hostname -I | awk '{print $1}')"
