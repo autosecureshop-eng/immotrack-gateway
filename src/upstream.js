@@ -36,12 +36,15 @@ async function report(imei, pos) {
   } catch (e) { console.error("report failed", imei, e.message); }
 }
 
-/** Fetch queued commands for this IMEI (the function marks them sent). */
+/**
+ * Fetch queued commands for this IMEI (the function marks them sent), plus the
+ * vehicle's configured heartbeat { on, off } seconds so live_off can restore it.
+ */
 async function poll(imei) {
   try {
     const { json } = await call({ action: "poll", imei });
-    return json.commands || [];
-  } catch (e) { console.error("poll failed", imei, e.message); return []; }
+    return { commands: json.commands || [], timing: json.timing || null };
+  } catch (e) { console.error("poll failed", imei, e.message); return { commands: [], timing: null }; }
 }
 
 /** Report a command result. */

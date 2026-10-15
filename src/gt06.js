@@ -45,6 +45,8 @@ const GPS = 0x12;
 const STATUS = 0x13;
 const GPS_LBS = 0x22;
 const GPS_LBS_2 = 0x16;
+const COMMAND_RESP = 0x15;   // device's answer to an online command (older firmware)
+const COMMAND_RESP_2 = 0x21; // same, newer firmware
 
 /** IMEI from a login packet (8 bytes BCD, 16 nibbles; drop a leading 0). */
 function parseLogin(content) {
@@ -128,7 +130,37 @@ function immobiliseText(on, password = "000000") {
   return on ? `DYD,${password}#` : `HFYD,${password}#`;
 }
 
+/** Upload interval: T1 seconds while ACC (ignition) is on, T2 while off. Range 5..18000. */
+const clampPeriod = (s) => Math.min(18000, Math.max(5, Math.round(s)));
+function timingText(onS, offS) {
+  return `TIMER,${clampPeriod(onS)},${clampPeriod(offS)}#`;
+}
+
+/** Ask for the current position; the device answers with a text line. */
+function locateText() { return "WHERE#"; }
+
+/** ASCII text from a 0x15 / 0x21 command-response content block:
+ *  [len:1][server flag:4][text][language:2]; len covers the flag + text. */
+function parseResponseText(content) {
+  const len = content[0] ?? 0;
+  const text = content.subarray(5, Math.min(content.length, 1 + len)).toString("ascii");
+  return text.replace(/[^\x20-\x7e]/g, "");
+}
+
+/** Position from a WHERE# reply, e.g. "Lat:N52.473210,Lon:W1.903280,Course:0.00,Speed:0.0,DateTime:..." */
+function parseWhere(text) {
+  const m = /Lat:\s*([NS])?\s*(-?\d+(?:\.\d+)?)\s*,?\s*Lon\w*:\s*([EW])?\s*(-?\d+(?:\.\d+)?)/i.exec(text);
+  if (!m) return null;
+  let lat = Number(m[2]), lng = Number(m[4]);
+  if ((m[1] || "").toUpperCase() === "S") lat = -Math.abs(lat);
+  if ((m[3] || "").toUpperCase() === "W") lng = -Math.abs(lng);
+  const spd = /Speed:\s*(\d+(?:\.\d+)?)/i.exec(text);
+  const crs = /Course:\s*(\d+(?:\.\d+)?)/i.exec(text);
+  return { lat, lng, time: Date.now(), speed: spd ? Number(spd[1]) : undefined, heading: crs ? Number(crs[1]) : undefined };
+}
+
 module.exports = {
-  nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, ack, buildCommand, immobiliseText,
-  LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2,
+  nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, ack, buildCommand,
+  immobiliseText, timingText, locateText, parseResponseText, parseWhere,
+  LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2, COMMAND_RESP, COMMAND_RESP_2,
 };

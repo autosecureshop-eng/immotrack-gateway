@@ -39,6 +39,14 @@ function parseAvl(buf) {
   if (crcGot !== crcCalc) throw new Error(`teltonika crc ${crcGot.toString(16)} != ${crcCalc.toString(16)}`);
 
   const codec = data[0];
+  if (codec === 0x0c) {
+    // Codec 12 = the device's reply to a GPRS command we sent:
+    // [0x0C][qty 1][type 0x06][len:4][ASCII text][qty 2]. Returned as text so
+    // the session can attach it to the command's ack instead of dropping.
+    const len = data.readUInt32BE(3);
+    const response = data.toString("ascii", 7, 7 + len).replace(/[^\x20-\x7e]/g, "");
+    return { records: [], count: 0, consumed: total, response };
+  }
   const ext = codec === 0x8e;
   if (codec !== 0x08 && codec !== 0x8e) throw new Error("not an AVL data packet (codec " + codec.toString(16) + ")");
   let p = 1;
@@ -139,4 +147,48 @@ function immobiliseText(on) {
   return on ? "setdigout 1" : "setdigout 0";
 }
 
-module.exports = { parseImei, IMEI_ACCEPT, IMEI_REJECT, parseAvl, avlAck, buildCommand, immobiliseText };
+// Data-acquisition periods (seconds). FMB/FMC parameter IDs:
+//   Home network:  on-stop Min Period 10000 / Send Period 10005,
+//                  moving  Min Period 10050 / Send Period 10055
+//   Roaming = +100 (10100/10105, 10150/10155), Unknown network = +200.
+// UK IoT SIMs often attach as "roaming", so all three sets are written at once.
+// If a firmware disagrees, check the FMB920 parameter list on the Teltonika wiki.
+// Note: reporting while parked also needs Sleep Mode (param 102) left at 0/GPS
+// sleep — deep sleep stops the device sending between wake-ups.
+const PERIOD_IDS = {
+  moveMin: [10050, 10150, 10250], moveSend: [10055, 10155, 10255],
+  stopMin: [10000, 10100, 10200], stopSend: [10005, 10105, 10205],
+};
+/** setparam text for a heartbeat of [onS] seconds moving / [offS] seconds stopped. */
+function timingText(onS, offS) {
+  const on = Math.max(1, Math.round(onS)), off = Math.max(1, Math.round(offS));
+  const parts = [];
+  for (const id of PERIOD_IDS.moveMin) parts.push(`${id}:${on}`);
+  for (const id of PERIOD_IDS.moveSend) parts.push(`${id}:${on}`);
+  for (const id of PERIOD_IDS.stopMin) parts.push(`${id}:${off}`);
+  for (const id of PERIOD_IDS.stopSend) parts.push(`${id}:${off}`);
+  return "setparam " + parts.join(";");
+}
+
+/** Ask for the current fix; the device answers (Codec 12) with a text line. */
+function locateText() { return "getgps"; }
+
+/** Position from a getgps reply, e.g. "GPS:1 Sat:9 Lat:52.4862 Long:-1.8904 Alt:120 Speed:0 Dir:0 Date: ..." */
+function parseGetGps(text) {
+  const lat = /Lat:\s*(-?\d+(?:\.\d+)?)/i.exec(text);
+  const lng = /Lon\w*:\s*(-?\d+(?:\.\d+)?)/i.exec(text);
+  if (!lat || !lng) return null;
+  const spd = /Speed:\s*(\d+(?:\.\d+)?)/i.exec(text);
+  const dir = /Dir:\s*(\d+(?:\.\d+)?)/i.exec(text);
+  const sat = /Sat:\s*(\d+)/i.exec(text);
+  return {
+    lat: Number(lat[1]), lng: Number(lng[1]), time: Date.now(),
+    speed: spd ? Number(spd[1]) : undefined, heading: dir ? Number(dir[1]) : undefined,
+    satellites: sat ? Number(sat[1]) : undefined,
+  };
+}
+
+module.exports = {
+  parseImei, IMEI_ACCEPT, IMEI_REJECT, parseAvl, avlAck, buildCommand,
+  immobiliseText, timingText, locateText, parseGetGps, PERIOD_IDS,
+};

@@ -69,3 +69,43 @@ test("gt06: immobilise command builds with a valid CRC", () => {
   assert.equal(crc, crcItu(lenAndBody));
   assert.ok(f.includes(Buffer.from("DYD,000000#", "ascii")));
 });
+
+// ---- heartbeat timing, locate-now and device replies -------------------------
+
+test("teltonika: timing command writes moving + stopped periods for all network modes", () => {
+  const t = tel.timingText(20, 300);
+  assert.ok(t.startsWith("setparam "));
+  for (const id of [10050, 10055, 10150, 10155, 10250, 10255]) assert.ok(t.includes(`${id}:20`), String(id));
+  for (const id of [10000, 10005, 10100, 10105, 10200, 10205]) assert.ok(t.includes(`${id}:300`), String(id));
+});
+
+test("teltonika: a Codec 12 reply comes back as text (not an error) and getgps parses", () => {
+  const text = Buffer.from("GPS:1 Sat:9 Lat:52.4862 Long:-1.8904 Alt:120 Speed:0 Dir:0", "ascii");
+  const len = Buffer.alloc(4); len.writeUInt32BE(text.length, 0);
+  const data = Buffer.concat([Buffer.from([0x0c, 0x01, 0x06]), len, text, Buffer.from([0x01])]);
+  const pkt = Buffer.alloc(8 + data.length + 4);
+  pkt.writeUInt32BE(0, 0); pkt.writeUInt32BE(data.length, 4); data.copy(pkt, 8); pkt.writeUInt32BE(crc16ibm(data), 8 + data.length);
+  const r = tel.parseAvl(pkt);
+  assert.equal(r.count, 0);
+  assert.equal(r.consumed, pkt.length);
+  assert.match(r.response, /Lat:52\.4862/);
+  const pos = tel.parseGetGps(r.response);
+  assert.equal(pos.lat, 52.4862); assert.equal(pos.lng, -1.8904); assert.equal(pos.satellites, 9);
+});
+
+test("gt06: timing command uses TIMER,<acc on>,<acc off># within device limits", () => {
+  assert.equal(gt.timingText(20, 300), "TIMER,20,300#");
+  assert.equal(gt.timingText(1, 99999), "TIMER,5,18000#");
+});
+
+test("gt06: WHERE# reply parses with hemisphere letters", () => {
+  const p = gt.parseWhere("Lat:N52.473210,Lon:W1.903280,Course:12.00,Speed:0.0,DateTime:2026-10-15 09:00:00");
+  assert.equal(p.lat, 52.47321); assert.equal(p.lng, -1.90328); assert.equal(p.heading, 12);
+  assert.equal(gt.parseWhere("no fix"), null);
+});
+
+test("gt06: command-response text is extracted from a 0x15 content block", () => {
+  const txt = Buffer.from("TIMER OK", "ascii");
+  const content = Buffer.concat([Buffer.from([4 + txt.length]), Buffer.from([0, 0, 0, 1]), txt, Buffer.from([0x00, 0x02])]);
+  assert.equal(gt.parseResponseText(content), "TIMER OK");
+});
