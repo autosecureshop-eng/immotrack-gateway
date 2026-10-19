@@ -175,7 +175,27 @@ net.createServer((sock) => {
           imei = gt.parseLogin(content);
           sock.write(gt.ack(protocol, serial));
           log("gt06 login", imei, sock.remoteAddress);
-        } else if (protocol === gt.GPS || protocol === gt.GPS_LBS || protocol === gt.GPS_LBS_2) {
+        } else if (protocol === gt.GPS_LBS_2 || protocol === gt.ALARM_1 || protocol === gt.ALARM_2) {
+          // Alarm packet: position + status + the alarm that caused it (power
+          // cut, vibration, SOS…). Forward the alarm once; keep the status bits.
+          sock.write(gt.ack(protocol, serial));
+          if (imei) {
+            const a = gt.parseAlarm(content);
+            const { alarm, lat, lng, time, speed, heading, ...st } = a;
+            if (st.ignition != null) status = { ...status, ...st };
+            const pos = (lat || lng) ? { lat, lng, time, speed, heading } : prevFix;
+            if (alarm) log("gt06 alarm", imei, alarm);
+            if (pos) {
+              if (lat || lng) {
+                lastSpeed = speed;
+                if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
+                prevFix = pos;
+              }
+              await up.report(imei, { ...pos, ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() });
+            }
+            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+          }
+        } else if (protocol === gt.GPS || protocol === gt.GPS_LBS) {
           sock.write(gt.ack(protocol, serial));
           if (imei) {
             const pos = gt.parseLocation(content);
@@ -189,8 +209,18 @@ net.createServer((sock) => {
           }
         } else if (protocol === gt.STATUS) {
           sock.write(gt.ack(protocol, serial));
-          status = gt.parseStatus(content);
-          if (imei) pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+          const { alarm: hbAlarm, ...st } = gt.parseStatus(content);
+          status = st;
+          // The status frame carries fresh GSM signal / voltage / ignition /
+          // external-power but no GPS. Push it to the platform against the last
+          // known position (stamped now) so signal, power and "online" stay
+          // current between fixes — e.g. a parked vehicle that only heartbeats.
+          // Skipped until we have a fix. Its alarm bits go on this report only.
+          if (imei) {
+            if (hbAlarm) log("gt06 status alarm", imei, hbAlarm);
+            if (prevFix) await up.report(imei, { ...prevFix, ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() });
+            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+          }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
           // The device's text answer to an online command (no ack expected).
           if (imei) pending = await handleReply(imei, pending, gt.parseResponseText(content), gt.parseWhere);

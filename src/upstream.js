@@ -31,6 +31,8 @@ async function report(imei, pos) {
       heading: pos.heading, battery: pos.battery,
       ignition: pos.ignition, voltage: pos.voltage, odometer_km: pos.odometerKm,
       gsm: pos.gsm, sats: pos.satellites,
+      // external 12 V feed connected (true/false/undefined) + one-shot alarm
+      ext_power: pos.extPower, alarm: pos.alarm,
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
   } catch (e) { console.error("report failed", imei, e.message); }

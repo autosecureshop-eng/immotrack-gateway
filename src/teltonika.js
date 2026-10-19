@@ -110,6 +110,10 @@ function parseAvl(buf) {
       voltage: io[66] == null ? undefined : io[66] / 1000,
       batteryVolts: io[67] == null ? undefined : io[67] / 1000,
       odometerKm: io[16] == null ? undefined : io[16] / 1000,
+      // External 12 V present: 252 "unplug" (1 = unplugged) wins, else 66 > 6 V.
+      extPower: io[252] != null ? io[252] !== 1 : io[66] == null ? undefined : io[66] > 6000,
+      // 252 unplug -> power cut, 246 towing, 247 crash (eventual-record IOs).
+      alarm: io[252] === 1 ? "powercut" : io[246] === 1 ? "tow" : io[247] ? "crash" : undefined,
     });
   }
   return { records, count: n, consumed: total };

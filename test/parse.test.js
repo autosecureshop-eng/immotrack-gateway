@@ -27,6 +27,12 @@ test("teltonika: Codec 8 record parses and CRC validates", () => {
   assert.equal(r.consumed, TEL_CODEC8.length);
 });
 
+test("teltonika: GSM signal (IO id 21 / CSQ) is extracted", () => {
+  // The canonical example packet carries IO id 0x15 (21) = 3.
+  const r = tel.parseAvl(TEL_CODEC8);
+  assert.equal(r.records[0].gsm, 3);
+});
+
 test("teltonika: a tampered CRC is rejected", () => {
   const bad = Buffer.from(TEL_CODEC8);
   bad[bad.length - 1] ^= 0xff;
@@ -68,6 +74,44 @@ test("gt06: immobilise command builds with a valid CRC", () => {
   const crc = f.readUInt16BE(f.length - 4);
   assert.equal(crc, crcItu(lenAndBody));
   assert.ok(f.includes(Buffer.from("DYD,000000#", "ascii")));
+});
+
+test("gt06: status frame yields GSM level (CSQ), voltage and ignition", () => {
+  // [terminal info][voltage level 0..6][gsm level 0..4][alarm/lang:2]
+  const content = Buffer.from([0x02, 0x05, 0x04, 0x00, 0x01]); // ACC on, volt 5, gsm 4
+  const s = gt.parseStatus(content);
+  assert.equal(s.gsm, 4);
+  assert.equal(s.ignition, true);
+  assert.equal(s.voltage, 12.8);
+  assert.equal(s.extPower, false);
+  assert.equal(s.alarm, undefined);
+});
+
+test("gt06: terminal info decodes external power, power-cut alarm bits and relay", () => {
+  // 0x46 = GPS on + charging + ACC on; 0x12 = ACC on + alarm 010 (power cut), not charging
+  assert.equal(gt.parseStatus(Buffer.from([0x46, 6, 4])).extPower, true);
+  const cut = gt.parseStatus(Buffer.from([0x12, 6, 4]));
+  assert.equal(cut.extPower, false);
+  assert.equal(cut.alarm, "powercut");
+  assert.equal(cut.ignition, true);
+  assert.equal(gt.parseStatus(Buffer.from([0x80, 6, 4])).relayCut, true);
+});
+
+test("gt06: 0x16 alarm packet yields position, status and the alarm byte", () => {
+  const loc = Buffer.alloc(18);
+  loc.set([26, 10, 19, 15, 30, 0, 0xc9], 0);           // 2026-10-19 15:30:00, 9 sats
+  loc.writeUInt32BE(Math.round(52.48 * 1800000), 7);
+  loc.writeUInt32BE(Math.round(1.89 * 1800000), 11);
+  loc[15] = 40;                                          // 40 km/h
+  loc.writeUInt16BE(0x0400 | 0x0800 | 90, 16);           // north, west, course 90
+  const lbs = Buffer.from([0x09, 0x00, 0xea, 0x0a, 0x12, 0x34, 0x00, 0x56, 0x78]);
+  const tail = Buffer.from([0x42, 0x06, 0x04, 0x02, 0x02]); // ACC on, no charge, alarm 0x02
+  const a = gt.parseAlarm(Buffer.concat([loc, lbs, tail]));
+  assert.equal(a.alarm, "powercut");
+  assert.equal(a.extPower, false);
+  assert.equal(a.ignition, true);
+  assert.equal(a.speed, 40);
+  assert.ok(Math.abs(a.lng + 1.89) < 1e-5);
 });
 
 // ---- heartbeat timing, locate-now and device replies -------------------------

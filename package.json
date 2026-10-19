@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "immotrack-gateway",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "private": true,
   "description": "IMMOTRACK gateway: GT06 / Teltonika FMB920-FMC920 trackers -> IMMOTRACK tracker API. Positions, heartbeat timing, live mode, remote immobilise.",
   "main": "src/server.js",

@@ -44,7 +44,9 @@ const LOGIN = 0x01;
 const GPS = 0x12;
 const STATUS = 0x13;
 const GPS_LBS = 0x22;
-const GPS_LBS_2 = 0x16;
+const GPS_LBS_2 = 0x16;      // GPS + LBS + status + alarm byte (the alarm packet)
+const ALARM_1 = 0x26;        // alarm packet, multi-fence variant (same layout)
+const ALARM_2 = 0x27;        // alarm packet, some newer firmware (same layout)
 const COMMAND_RESP = 0x15;   // device's answer to an online command (older firmware)
 const COMMAND_RESP_2 = 0x21; // same, newer firmware
 
@@ -70,11 +72,24 @@ function parseLocation(content) {
   return { time, lat, lng, speed, heading: course };
 }
 
+/** Terminal-info bits 3..5 alarm code -> our alarm names. */
+const INFO_ALARM = { 1: "vibration", 2: "powercut", 3: "lowbattery", 4: "sos" };
+
+/** Alarm byte of a 0x16 / 0x26 / 0x27 alarm packet -> our alarm names. */
+const ALARM_BYTE = {
+  0x01: "sos", 0x02: "powercut", 0x03: "vibration", 0x09: "movement",
+  0x0e: "lowbattery", 0x0f: "lowbattery", 0x13: "powercut", 0x14: "tow",
+};
+
 /**
  * Status / heartbeat (0x13): terminal info byte, voltage level, GSM level.
- * Terminal info bit 1 = ACC (ignition) on, bit 0 = defence (armed), bit 2 = oil
- * & electricity disconnected (our relay cut), bit 6 = GPS tracking on.
- * Voltage level 0..6 (no battery .. full); GSM level 0..4.
+ * Terminal info: bit 0 = defence (armed), bit 1 = ACC (ignition) on, bit 2 =
+ * charging (external 12 V feed connected), bits 3..5 = alarm (001 vibration,
+ * 010 power cut, 011 low battery, 100 SOS), bit 6 = GPS tracking on, bit 7 =
+ * oil & electricity disconnected (our relay cut).
+ * Voltage level 0..6 is the tracker's OWN backup battery (no battery .. full),
+ * so it stays high after the car feed is cut — extPower is the real signal.
+ * GSM level 0..4.
  */
 function parseStatus(content) {
   const info = content[0] ?? 0;
@@ -83,13 +98,33 @@ function parseStatus(content) {
   return {
     ignition: (info & 0x02) !== 0,
     armed: (info & 0x01) !== 0,
-    relayCut: (info & 0x04) !== 0,
+    extPower: (info & 0x04) !== 0,
+    alarm: INFO_ALARM[(info >> 3) & 0x07] || undefined,
+    relayCut: (info & 0x80) !== 0,
     voltageLevel: voltageLevel == null ? undefined : voltageLevel,
     // The GT06 reports a 0..6 level, not volts; map it onto a plausible 12 V
     // car range so the app can show one "voltage" chip for every device type.
     voltage: voltageLevel == null ? undefined : [0, 10.8, 11.5, 12.0, 12.4, 12.8, 13.5][Math.min(voltageLevel, 6)],
     gsm: gsmLevel == null ? undefined : gsmLevel,
   };
+}
+
+/**
+ * Alarm packet (0x16 / 0x26 / 0x27): a location block (18 bytes), then LBS
+ * (its first byte is the LBS length incl. itself, usually 9), then the same
+ * terminal info / voltage / GSM bytes as a status frame, then the alarm byte.
+ * Returns { ...position, ...status, alarm } — alarm from the alarm byte wins
+ * over the terminal-info alarm bits.
+ */
+function parseAlarm(content) {
+  const pos = parseLocation(content);
+  let p = 18;
+  const lbsLen = content[p];
+  p += lbsLen >= 8 && lbsLen <= 12 ? lbsLen : 9;
+  if (content.length < p + 4) return { ...pos };
+  const st = parseStatus(content.subarray(p, p + 3));
+  const code = content[p + 3];
+  return { ...pos, ...st, alarm: ALARM_BYTE[code] || st.alarm };
 }
 
 /** Standard ack: echo the protocol + serial back. */
@@ -160,7 +195,7 @@ function parseWhere(text) {
 }
 
 module.exports = {
-  nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, ack, buildCommand,
+  nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, parseAlarm, ack, buildCommand,
   immobiliseText, timingText, locateText, parseResponseText, parseWhere,
-  LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2, COMMAND_RESP, COMMAND_RESP_2,
+  LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2, ALARM_1, ALARM_2, COMMAND_RESP, COMMAND_RESP_2,
 };
