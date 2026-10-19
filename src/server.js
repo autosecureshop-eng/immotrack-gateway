@@ -184,7 +184,7 @@ net.createServer((sock) => {
             const { alarm, lat, lng, time, speed, heading, ...st } = a;
             if (st.ignition != null) status = { ...status, ...st };
             const pos = (lat || lng) ? { lat, lng, time, speed, heading } : prevFix;
-            if (alarm) log("gt06 alarm", imei, alarm);
+            if (alarm) log("gt06 alarm", imei, alarm, "ext=" + st.extPower);
             if (pos) {
               if (lat || lng) {
                 lastSpeed = speed;
@@ -210,6 +210,7 @@ net.createServer((sock) => {
         } else if (protocol === gt.STATUS) {
           sock.write(gt.ack(protocol, serial));
           const { alarm: hbAlarm, ...st } = gt.parseStatus(content);
+          if (st.extPower !== status.extPower) log("gt06 ext power", imei, st.extPower ? "connected" : "disconnected", "info=0x" + (content[0] ?? 0).toString(16));
           status = st;
           // The status frame carries fresh GSM signal / voltage / ignition /
           // external-power but no GPS. Push it to the platform against the last
