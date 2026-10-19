@@ -88,7 +88,7 @@ const ALARM_BYTE = {
  * 010 power cut, 011 low battery, 100 SOS), bit 6 = GPS tracking on, bit 7 =
  * oil & electricity disconnected (our relay cut).
  * Voltage level 0..6 is the tracker's OWN backup battery (no battery .. full),
- * so it stays high after the car feed is cut — extPower is the real signal.
+ * so it stays high after the car feed is cut.
  * GSM level 0..4.
  */
 function parseStatus(content) {
@@ -98,6 +98,9 @@ function parseStatus(content) {
   return {
     ignition: (info & 0x02) !== 0,
     armed: (info & 0x01) !== 0,
+    // Bit 2 tracks the car feed on the test unit (0 while unplugged, 1 straight
+    // after reconnect, verified 2026-10-19). The server only alerts on a seen
+    // true -> false change, so units that never set it can't false-alarm.
     extPower: (info & 0x04) !== 0,
     alarm: INFO_ALARM[(info >> 3) & 0x07] || undefined,
     relayCut: (info & 0x80) !== 0,

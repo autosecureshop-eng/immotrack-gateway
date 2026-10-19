@@ -150,6 +150,9 @@ net.createServer((sock) => {
 
 // ---- GT06 -------------------------------------------------------------------
 
+/** Last fix + odometer per IMEI, kept across reconnects (in memory). */
+const lastByImei = new Map();
+
 net.createServer((sock) => {
   let buf = Buffer.alloc(0);
   let imei = null;
@@ -175,6 +178,11 @@ net.createServer((sock) => {
           imei = gt.parseLogin(content);
           sock.write(gt.ack(protocol, serial));
           log("gt06 login", imei, sock.remoteAddress);
+          // A GT06 reboots when its power comes back; carry the last fix and
+          // odometer over so its first heartbeats (before a new GPS fix) still
+          // reach the platform — power/ignition changes show straight away.
+          const saved = lastByImei.get(imei);
+          if (saved && !prevFix) { prevFix = { ...saved.fix, speed: 0 }; odometerKm = saved.odo; }
         } else if (protocol === gt.GPS_LBS_2 || protocol === gt.ALARM_1 || protocol === gt.ALARM_2) {
           // Alarm packet: position + status + the alarm that caused it (power
           // cut, vibration, SOS…). Forward the alarm once; keep the status bits.
@@ -230,6 +238,7 @@ net.createServer((sock) => {
           sock.write(gt.ack(protocol, serial));
           if (imei) pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
         }
+        if (imei && prevFix) lastByImei.set(imei, { fix: prevFix, odo: odometerKm });
       }
     } catch (e) {
       log("gt06 error", imei, e.message);
