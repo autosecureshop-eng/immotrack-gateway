@@ -193,14 +193,13 @@ net.createServer((sock) => {
             if (st.ignition != null) status = { ...status, ...st };
             const pos = (lat || lng) ? { lat, lng, time, speed, heading } : prevFix;
             if (alarm) log("gt06 alarm", imei, alarm, "ext=" + st.extPower);
-            if (pos) {
-              if (lat || lng) {
-                lastSpeed = speed;
-                if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
-                prevFix = pos;
-              }
-              await up.report(imei, { ...pos, ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() });
+            if (lat || lng) {
+              lastSpeed = speed;
+              if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
+              prevFix = pos;
             }
+            // Even with no fix at all the alarm still goes up (status-only report).
+            await up.report(imei, { ...(pos || {}), ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() });
             pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
           }
         } else if (protocol === gt.GPS || protocol === gt.GPS_LBS) {
@@ -227,7 +226,9 @@ net.createServer((sock) => {
           // Skipped until we have a fix. Its alarm bits go on this report only.
           if (imei) {
             if (hbAlarm) log("gt06 status alarm", imei, hbAlarm);
-            if (prevFix) await up.report(imei, { ...prevFix, ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() });
+            // No fix yet on this connection: send status only — the platform
+            // pins it to the vehicle's last known position.
+            await up.report(imei, { ...(prevFix || {}), ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() });
             pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
           }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
