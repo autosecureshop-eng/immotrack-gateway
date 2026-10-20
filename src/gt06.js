@@ -77,8 +77,12 @@ const INFO_ALARM = { 1: "vibration", 2: "powercut", 3: "lowbattery", 4: "sos" };
 
 /** Alarm byte of a 0x16 / 0x26 / 0x27 alarm packet -> our alarm names. */
 const ALARM_BYTE = {
-  0x01: "sos", 0x02: "powercut", 0x03: "vibration", 0x09: "movement",
-  0x0e: "lowbattery", 0x0f: "lowbattery", 0x13: "powercut", 0x14: "tow",
+  0x01: "sos", 0x02: "powercut", 0x03: "vibration", 0x04: "geofence_in", 0x05: "geofence_out",
+  0x06: "overspeed", 0x09: "movement", 0x0a: "gps_lost", 0x0b: "gps_restored", 0x0c: "poweron",
+  0x0d: "first_fix", 0x0e: "lowbattery", 0x0f: "lowbattery", 0x11: "poweroff", 0x13: "powercut",
+  0x14: "tow", 0x17: "jamming", 0x18: "tamper", 0x19: "poweroff",
+  // Concox extended driving-behaviour codes
+  0x29: "harsh_accel", 0x30: "harsh_brake", 0x2a: "harsh_turn", 0x2b: "harsh_turn", 0x2c: "collision",
 };
 
 /**

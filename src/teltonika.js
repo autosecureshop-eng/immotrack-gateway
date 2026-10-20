@@ -112,8 +112,14 @@ function parseAvl(buf) {
       odometerKm: io[16] == null ? undefined : io[16] / 1000,
       // External 12 V present: 252 "unplug" (1 = unplugged) wins, else 66 > 6 V.
       extPower: io[252] != null ? io[252] !== 1 : io[66] == null ? undefined : io[66] > 6000,
-      // 252 unplug -> power cut, 246 towing, 247 crash (eventual-record IOs).
-      alarm: io[252] === 1 ? "powercut" : io[246] === 1 ? "tow" : io[247] ? "crash" : undefined,
+      // Eventual-record IOs -> one-shot alarm names (first match wins):
+      // 252 unplug, 236 alarm/SOS, 247 crash, 246 towing, 249 jamming, 255 overspeed,
+      // 253 green driving (1 accel, 2 brake, 3 cornering), 251 idling, 250 trip, 1 DIN1.
+      alarm: io[252] === 1 ? "powercut" : io[236] === 1 ? "sos" : io[247] ? "crash" : io[246] === 1 ? "tow"
+        : io[249] === 1 ? "jamming" : io[255] === 1 ? "overspeed"
+        : io[253] === 1 ? "harsh_accel" : io[253] === 2 ? "harsh_brake" : io[253] === 3 ? "harsh_turn"
+        : io[251] === 1 ? "idle" : io[250] === 1 ? "trip_start" : io[250] === 0 && io[250] != null ? "trip_end"
+        : io[1] === 1 ? "din1" : undefined,
     });
   }
   return { records, count: n, consumed: total };
