@@ -29,6 +29,7 @@ const up = require("./upstream");
 const TELTONIKA_PORT = Number(process.env.TELTONIKA_PORT || 5027);
 const GT06_PORT = Number(process.env.GT06_PORT || 5023);
 const MOVING_KMH = 3;
+const INSTANT_KMH = 32; // 20 mph — consented instant cut ceiling
 const LIVE_S = Number(process.env.LIVE_PERIOD_S || 5); // reporting period while Live is on
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
@@ -58,16 +59,20 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
   const { commands, timing } = await up.poll(imei);
   let sent = null;
   for (const c of commands) {
-    if (c.command === "immobilise" && lastSpeed != null && lastSpeed > MOVING_KMH) {
-      await up.ack(imei, c.id, false, "held: vehicle moving");
-      log(imei, "HELD immobilise — moving", lastSpeed);
+    // Safe immobilise waits for a stationary vehicle; "instant" (consented, hire-fleet
+    // style, tracker-only) may cut at or under 20 mph (32 km/h) — never faster.
+    const limit = c.command === "immobilise_instant" ? INSTANT_KMH : c.command === "immobilise" ? MOVING_KMH : null;
+    if (limit != null && lastSpeed != null && lastSpeed > limit) {
+      await up.ack(imei, c.id, false, `held: vehicle moving (${Math.round(lastSpeed)} km/h > ${limit})`);
+      log(imei, "HELD", c.command, "— moving", lastSpeed);
       continue;
     }
     try {
       let text = null;
       switch (c.command) {
         // An explicit arg (e.g. "RELAY,1#" for a GS900) overrides the protocol default.
-        case "immobilise": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(true); break;
+        case "immobilise":
+        case "immobilise_instant": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(true); break;
         case "mobilise": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(false); break;
         case "locate_now": text = dialect.locateText(); break;
         case "buzzer": text = dialect.buzzerText ? dialect.buzzerText() : null; break;
