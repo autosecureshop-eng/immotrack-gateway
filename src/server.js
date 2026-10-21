@@ -66,8 +66,9 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
     try {
       let text = null;
       switch (c.command) {
-        case "immobilise": text = dialect.immobiliseText(true); break;
-        case "mobilise": text = dialect.immobiliseText(false); break;
+        // An explicit arg (e.g. "RELAY,1#" for a GS900) overrides the protocol default.
+        case "immobilise": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(true); break;
+        case "mobilise": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(false); break;
         case "locate_now": text = dialect.locateText(); break;
         case "buzzer": text = dialect.buzzerText ? dialect.buzzerText() : null; break;
         case "set_timing": { const t = parseTiming(c.arg); text = t ? dialect.timingText(t.on, t.off) : null; break; }
