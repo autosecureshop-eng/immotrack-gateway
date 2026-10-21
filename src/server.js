@@ -175,7 +175,7 @@ net.createServer((sock) => {
   // login and every 5 min while idle. Units that don't know the command just
   // don't answer. A real reading is trusted for 20 min.
   let realVolt = null, realVoltAt = 0, voltAskedAt = 0;
-  const VOLT_POLL_MS = 5 * 60_000, VOLT_TRUST_MS = 20 * 60_000;
+  const VOLT_POLL_MS = 90_000, VOLT_TRUST_MS = 20 * 60_000;
   const sendCmd = (t) => sock.write(gt.buildCommand(t));
   const askVoltage = () => { sendCmd("POWERLEVEL#"); voltAskedAt = Date.now(); };
   sock.on("data", async (chunk) => {
@@ -191,7 +191,7 @@ net.createServer((sock) => {
           imei = gt.parseLogin(content);
           sock.write(gt.ack(protocol, serial));
           log("gt06 login", imei, sock.remoteAddress);
-          if (imei) askVoltage();
+          if (imei) { askVoltage(); setTimeout(() => { try { if (realVolt == null) askVoltage(); } catch (_e) {} }, 15_000); }  // retry — GS900 often ignores the first POWERLEVEL#
           // A GT06 reboots when its power comes back; carry the last fix and
           // odometer over so its first heartbeats (before a new GPS fix) still
           // reach the platform — power/ignition changes show straight away.
@@ -231,7 +231,7 @@ net.createServer((sock) => {
         } else if (protocol === gt.STATUS) {
           sock.write(gt.ack(protocol, serial));
           const { alarm: hbAlarm, ...st } = gt.parseStatus(content);
-          if (st.extPower !== status.extPower) log("gt06 ext power", imei, st.extPower ? "connected" : "disconnected", "info=0x" + (content[0] ?? 0).toString(16));
+          if (st.extPower !== status.extPower) { log("gt06 ext power", imei, st.extPower ? "connected" : "disconnected", "info=0x" + (content[0] ?? 0).toString(16)); askVoltage(); }
           status = st;
           if (realVolt != null && Date.now() - realVoltAt < VOLT_TRUST_MS) status.voltage = realVolt;
           if (!pending && Date.now() - voltAskedAt > VOLT_POLL_MS) askVoltage();
