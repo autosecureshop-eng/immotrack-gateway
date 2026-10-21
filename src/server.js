@@ -165,7 +165,14 @@ net.createServer((sock) => {
   let status = {};
   let prevFix = null;
   let odometerKm = null;
+  // Real supply voltage: GT06-family status frames only carry a backup-battery
+  // level, so we ask the unit (GS900 "POWERLEVEL#" -> "POWERLEVEL_OK:11.80V") on
+  // login and every 5 min while idle. Units that don't know the command just
+  // don't answer. A real reading is trusted for 20 min.
+  let realVolt = null, realVoltAt = 0, voltAskedAt = 0;
+  const VOLT_POLL_MS = 5 * 60_000, VOLT_TRUST_MS = 20 * 60_000;
   const sendCmd = (t) => sock.write(gt.buildCommand(t));
+  const askVoltage = () => { sendCmd("POWERLEVEL#"); voltAskedAt = Date.now(); };
   sock.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     try {
@@ -179,6 +186,7 @@ net.createServer((sock) => {
           imei = gt.parseLogin(content);
           sock.write(gt.ack(protocol, serial));
           log("gt06 login", imei, sock.remoteAddress);
+          if (imei) askVoltage();
           // A GT06 reboots when its power comes back; carry the last fix and
           // odometer over so its first heartbeats (before a new GPS fix) still
           // reach the platform — power/ignition changes show straight away.
@@ -220,6 +228,8 @@ net.createServer((sock) => {
           const { alarm: hbAlarm, ...st } = gt.parseStatus(content);
           if (st.extPower !== status.extPower) log("gt06 ext power", imei, st.extPower ? "connected" : "disconnected", "info=0x" + (content[0] ?? 0).toString(16));
           status = st;
+          if (realVolt != null && Date.now() - realVoltAt < VOLT_TRUST_MS) status.voltage = realVolt;
+          if (!pending && Date.now() - voltAskedAt > VOLT_POLL_MS) askVoltage();
           // The status frame carries fresh GSM signal / voltage / ignition /
           // external-power but no GPS. Push it to the platform against the last
           // known position (stamped now) so signal, power and "online" stay
@@ -234,7 +244,14 @@ net.createServer((sock) => {
           }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
           // The device's text answer to an online command (no ack expected).
-          if (imei) pending = await handleReply(imei, pending, gt.parseResponseText(content), gt.parseWhere);
+          const text = gt.parseResponseText(content);
+          const mv = /POWERLEVEL_OK:\s*([\d.]+)\s*V/i.exec(text);
+          if (mv) {
+            realVolt = parseFloat(mv[1]); realVoltAt = Date.now(); status.voltage = realVolt;
+            log("gt06 voltage", imei, realVolt + "V");
+            if (imei) await up.report(imei, { ...(prevFix || {}), ...status, odometerKm: odometerKm ?? undefined, time: Date.now() });
+          }
+          if (imei && (!mv || pending)) pending = await handleReply(imei, pending, text, gt.parseWhere);
         } else {
           // heartbeat / alarms — ack so the device stays connected.
           sock.write(gt.ack(protocol, serial));

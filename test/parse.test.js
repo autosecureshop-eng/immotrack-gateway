@@ -82,7 +82,8 @@ test("gt06: status frame yields GSM level (CSQ), voltage and ignition", () => {
   const s = gt.parseStatus(content);
   assert.equal(s.gsm, 4);
   assert.equal(s.ignition, true);
-  assert.equal(s.voltage, 12.8);
+  assert.equal(s.voltage, undefined);   // no pretend volts — real volts come from POWERLEVEL#
+  assert.equal(s.battery, 83);          // backup-battery level 5/6
   assert.equal(s.extPower, false);
   assert.equal(s.alarm, undefined);
 });

@@ -109,9 +109,7 @@ function parseStatus(content) {
     alarm: INFO_ALARM[(info >> 3) & 0x07] || undefined,
     relayCut: (info & 0x80) !== 0,
     voltageLevel: voltageLevel == null ? undefined : voltageLevel,
-    // The GT06 reports a 0..6 level, not volts; map it onto a plausible 12 V
-    // car range so the app can show one "voltage" chip for every device type.
-    voltage: voltageLevel == null ? undefined : [0, 10.8, 11.5, 12.0, 12.4, 12.8, 13.5][Math.min(voltageLevel, 6)],
+    battery: voltageLevel == null ? undefined : Math.round(Math.min(voltageLevel, 6) / 6 * 100),
     gsm: gsmLevel == null ? undefined : gsmLevel,
   };
 }
