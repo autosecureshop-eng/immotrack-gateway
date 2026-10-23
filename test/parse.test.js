@@ -76,6 +76,24 @@ test("gt06: immobilise command builds with a valid CRC", () => {
   assert.ok(f.includes(Buffer.from("DYD,000000#", "ascii")));
 });
 
+test("gt06: clear_cache sends BACKUP,0# in a well-formed 0x80 frame", () => {
+  assert.equal(gt.clearCacheText(), "BACKUP,0#");
+  const f = gt.buildCommand(gt.clearCacheText());
+  const lenByte = f[2];
+  const lenAndBody = f.subarray(2, 2 + 1 + lenByte - 2);
+  assert.equal(f.readUInt16BE(f.length - 4), crcItu(lenAndBody));
+  assert.ok(f.includes(Buffer.from("BACKUP,0#", "ascii")));
+  // cmdLen counts the 4-byte server flag plus the command text.
+  assert.equal(f[4], 4 + "BACKUP,0#".length);
+});
+
+test("teltonika has no cache command, so clear_cache is unsupported there", () => {
+  // server.js falls back to "not supported by this device" when the dialect
+  // has no clearCacheText — the same path the buzzer command takes.
+  assert.equal(typeof gt.clearCacheText, "function");
+  assert.equal(tel.clearCacheText, undefined);
+});
+
 test("gt06: status frame yields GSM level (CSQ), voltage and ignition", () => {
   // [terminal info][voltage level 0..6][gsm level 0..4][alarm/lang:2]
   const content = Buffer.from([0x02, 0x05, 0x04, 0x00, 0x01]); // ACC on, volt 5, gsm 4

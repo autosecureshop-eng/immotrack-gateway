@@ -76,6 +76,10 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
         case "mobilise": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(false); break;
         case "locate_now": text = dialect.locateText(); break;
         case "buzzer": text = dialect.buzzerText ? dialect.buzzerText() : null; break;
+        // Drops the device's un-uploaded blind-spot buffer, so a unit back from
+        // a long dead zone stops replaying hours-old fixes. Teltonika has no
+        // equivalent and falls through to "not supported by this device".
+        case "clear_cache": text = dialect.clearCacheText ? dialect.clearCacheText() : null; break;
         case "set_timing": { const t = parseTiming(c.arg); text = t ? dialect.timingText(t.on, t.off) : null; break; }
         case "live_on": text = dialect.timingText(LIVE_S, LIVE_S); break;
         case "live_off": text = dialect.timingText(timing?.on ?? 20, timing?.off ?? 300); break;

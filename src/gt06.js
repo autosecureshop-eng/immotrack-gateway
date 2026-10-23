@@ -179,6 +179,19 @@ function timingText(onS, offS) {
 /** Ask for the current position; the device answers with a text line. */
 function locateText() { return "WHERE#"; }
 
+/**
+ * Clear the device's cached (blind-spot) data.
+ *
+ * A GT06 buffers fixes while it has no GPRS and replays them on reconnect. A
+ * unit that has been out of signal for a long time can come back and flood the
+ * gateway with stale positions, which land on the platform as a trail the
+ * vehicle drove hours ago. BACKUP,0# turns that buffer off and drops what is
+ * in it. Verified on a GS900 (IMEI 8651900744xxxxx).
+ *
+ * Destructive by design: anything cached and not yet uploaded is gone.
+ */
+function clearCacheText() { return "BACKUP,0#"; }
+
 /** ASCII text from a 0x15 / 0x21 command-response content block:
  *  [len:1][server flag:4][text][language:2]; len covers the flag + text. */
 function parseResponseText(content) {
@@ -201,6 +214,6 @@ function parseWhere(text) {
 
 module.exports = {
   nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, parseAlarm, ack, buildCommand,
-  immobiliseText, timingText, locateText, parseResponseText, parseWhere,
+  immobiliseText, timingText, locateText, clearCacheText, parseResponseText, parseWhere,
   LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2, ALARM_1, ALARM_2, COMMAND_RESP, COMMAND_RESP_2,
 };

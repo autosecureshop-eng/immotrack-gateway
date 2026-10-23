@@ -46,12 +46,20 @@ Watch it: `journalctl -u immotrack-gw -f`.
 | `locate_now` (panel open / Locate) | `getgps` → reply parsed into a position | `WHERE#` → reply parsed |
 | `set_timing` `on=20,off=300` (heartbeat) | `setparam` moving & stopped Min/Send periods (home, roaming, unknown) | `TIMER,20,300#` |
 | `live_on` / `live_off` (Live toggle) | periods → 5 s / back to the vehicle's timing | `TIMER,5,5#` / `TIMER,on,off#` |
+| `clear_cache` | *not supported* | `BACKUP,0#` |
 | `custom` | text as typed | text as typed |
 
 Teltonika period IDs used: moving 10050/10055 (+100 roaming, +200 unknown),
 stopped 10000/10005 (+100/+200). Reporting while parked also needs Sleep Mode
 (param 102) left at 0 or GPS-sleep. Check a device's reply in the command result
 if a firmware behaves differently.
+
+- **`clear_cache`** drops a GT06's blind-spot buffer. A unit that has been out
+  of GPRS for a long time replays its cached fixes on reconnect, which arrive at
+  the platform as a trail the vehicle drove hours ago; `BACKUP,0#` turns the
+  buffer off and discards it. **Destructive** — anything cached and not yet
+  uploaded is lost. Teltonika has no equivalent and answers "not supported by
+  this device".
 
 - **Safety:** remote immobilise is held if the last known speed shows the vehicle
   moving; it only ever prevents the next start. The tracker API enforces the same.
