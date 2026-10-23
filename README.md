@@ -61,8 +61,18 @@ if a firmware behaves differently.
   uploaded is lost. Teltonika has no equivalent and answers "not supported by
   this device".
 
-- **Safety:** remote immobilise is held if the last known speed shows the vehicle
-  moving; it only ever prevents the next start. The tracker API enforces the same.
+- **Safety:** remote immobilise is only sent when a **recent** speed reading
+  shows the vehicle slow enough — `src/safety.js`, tested in
+  `test/safety.test.js`. Unknown is not stationary and stale is not now, so a
+  cut is **held** when there is no reading yet on the connection, or the last
+  one is older than `SPEED_FRESH_MS`. The gateway asks the device for a fix at
+  the same time, so a retry succeeds seconds later. `mobilise` is never held.
+
+  This matters because `lastSpeed` starts null on every TCP connection: a unit
+  reconnecting mid-journey — out of a tunnel, back into signal — has no reading
+  at all. The API's check happens when the command is *queued*, so it cannot
+  cover a car that drove off afterwards. The gateway is the last guard before
+  the relay.
 
 ## Point each tracker at the gateway
 
@@ -88,7 +98,8 @@ with `TRACKER_GATEWAY_KEY`.
 | `TRACKER_GATEWAY_KEY` | shared secret; must equal the function secret of the same name |
 | `TELTONIKA_PORT` / `GT06_PORT` | listeners (default 5027 / 5023) |
 | `LIVE_PERIOD_S` | reporting period while Live is on (default 5) |
-| `COMMAND_POLL_S` | how often a connected device's command queue is flushed (default 20; `0` disables the timer and reverts to flushing only when the device sends something) |
+| `COMMAND_POLL_S` | how often a connected device's command queue is flushed (default 5; `0` disables the timer and reverts to flushing only when the device sends something) |
+| `SPEED_FRESH_MS` | how long a speed reading counts as current for the immobilise guard (default 90000) |
 
 `npm test` runs the protocol decoders and the upstream error handling offline
 (no network needed).

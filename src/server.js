@@ -25,11 +25,10 @@ const net = require("net");
 const tel = require("./teltonika");
 const gt = require("./gt06");
 const up = require("./upstream");
+const safety = require("./safety");
 
 const TELTONIKA_PORT = Number(process.env.TELTONIKA_PORT || 5027);
 const GT06_PORT = Number(process.env.GT06_PORT || 5023);
-const MOVING_KMH = 3;
-const INSTANT_KMH = 32; // 20 mph — consented instant cut ceiling
 const LIVE_S = Number(process.env.LIVE_PERIOD_S || 5); // reporting period while Live is on
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
@@ -55,16 +54,23 @@ function parseTiming(arg) {
  * Returns the last command sent ({id, command}) so the caller can attach the
  * device's text reply to its ack, or null if nothing was sent.
  */
-async function applyCommands(imei, send, dialect, lastSpeed) {
+async function applyCommands(imei, send, dialect, speed) {
   const { commands, timing } = await up.poll(imei);
   let sent = null;
+  let askedForFix = false;
   for (const c of commands) {
-    // Safe immobilise waits for a stationary vehicle; "instant" (consented, hire-fleet
-    // style, tracker-only) may cut at or under 20 mph (32 km/h) — never faster.
-    const limit = c.command === "immobilise_instant" ? INSTANT_KMH : c.command === "immobilise" ? MOVING_KMH : null;
-    if (limit != null && lastSpeed != null && lastSpeed > limit) {
-      await up.ack(imei, c.id, false, `held: vehicle moving (${Math.round(lastSpeed)} km/h > ${limit})`);
-      log(imei, "HELD", c.command, "— moving", lastSpeed);
+    // Whether this may be sent at all is decided in src/safety.js — unknown
+    // speed is not a stationary vehicle, and a stale reading is not "now".
+    const hold = safety.holdCheck(c.command, speed);
+    if (hold) {
+      // For unknown or stale, ask for a fix so the operator's retry succeeds
+      // in seconds rather than waiting on the vehicle's reporting interval.
+      if (hold.askFix && !askedForFix && dialect.locateText) {
+        try { send(dialect.locateText()); askedForFix = true; } catch (_e) { /* best effort */ }
+      }
+      const tail = hold.askFix ? " — asked the device for a fix, retry in a moment" : "";
+      await up.ack(imei, c.id, false, `held: ${hold.why}${tail}`);
+      log(imei, "HELD", c.command, "—", hold.why);
       continue;
     }
     try {
@@ -114,7 +120,7 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
 const sessions = new Map();
 const inFlight = new Set(); // guards against a timer tick racing a packet
 
-const COMMAND_POLL_S = Number(process.env.COMMAND_POLL_S || 20);
+const COMMAND_POLL_S = Number(process.env.COMMAND_POLL_S || 5);
 
 function openSession(imei, session) {
   if (!imei) return null;
@@ -168,6 +174,8 @@ net.createServer((sock) => {
   let imei = null;
   let lastSpeed = null;
   let pending = null; // last command sent, awaiting the device's Codec 12 reply
+  let lastSpeedAt = null;
+  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt });
   let session = null;
   sock.on("close", () => closeSession(imei, session));
   sock.on("data", async (chunk) => {
@@ -183,7 +191,7 @@ net.createServer((sock) => {
         session = openSession(imei, {
           send: (t) => sock.write(tel.buildCommand(t)),
           dialect: tel,
-          speed: () => lastSpeed,
+          speed: speedNow,
           setPending: (p) => { pending = p; },
         });
         return;
@@ -198,9 +206,9 @@ net.createServer((sock) => {
         }
         sock.write(tel.avlAck(pkt.count));
         for (const r of pkt.records) {
-          if (r.lat || r.lng) { lastSpeed = r.speed; await up.report(imei, r); }
+          if (r.lat || r.lng) { lastSpeed = r.speed; lastSpeedAt = Date.now(); await up.report(imei, r); }
         }
-        pending = (await applyCommands(imei, (t) => sock.write(tel.buildCommand(t)), tel, lastSpeed)) || pending;
+        pending = (await applyCommands(imei, (t) => sock.write(tel.buildCommand(t)), tel, speedNow())) || pending;
       }
     } catch (e) {
       log("teltonika error", imei, e.message);
@@ -234,6 +242,8 @@ net.createServer((sock) => {
   const VOLT_POLL_MS = 90_000, VOLT_TRUST_MS = 20 * 60_000;
   const sendCmd = (t) => sock.write(gt.buildCommand(t));
   const askVoltage = () => { sendCmd("POWERLEVEL#"); voltAskedAt = Date.now(); };
+  let lastSpeedAt = null;
+  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt });
   let session = null;
   sock.on("close", () => closeSession(imei, session));
   sock.on("data", async (chunk) => {
@@ -254,7 +264,7 @@ net.createServer((sock) => {
             setTimeout(() => { try { if (realVolt == null) askVoltage(); } catch (_e) {} }, 15_000);  // retry — GS900 often ignores the first POWERLEVEL#
             session = openSession(imei, {
               send: sendCmd, dialect: gt,
-              speed: () => lastSpeed,
+              speed: speedNow,
               setPending: (p) => { pending = p; },
             });
           }
@@ -274,25 +284,25 @@ net.createServer((sock) => {
             const pos = (lat || lng) ? { lat, lng, time, speed, heading } : prevFix;
             if (alarm) log("gt06 alarm", imei, alarm, "ext=" + st.extPower);
             if (lat || lng) {
-              lastSpeed = speed;
+              lastSpeed = speed; lastSpeedAt = Date.now();
               if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
               prevFix = pos;
             }
             // Even with no fix at all the alarm still goes up (status-only report).
             await up.report(imei, { ...(pos || {}), ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() });
-            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+            pending = (await applyCommands(imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.GPS || protocol === gt.GPS_LBS) {
           sock.write(gt.ack(protocol, serial));
           if (imei) {
             const pos = gt.parseLocation(content);
             if (pos.lat || pos.lng) {
-              lastSpeed = pos.speed;
+              lastSpeed = pos.speed; lastSpeedAt = Date.now();
               if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
               prevFix = pos;
               await up.report(imei, { ...pos, ...status, odometerKm: odometerKm ?? undefined });
             }
-            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+            pending = (await applyCommands(imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.STATUS) {
           sock.write(gt.ack(protocol, serial));
@@ -311,7 +321,7 @@ net.createServer((sock) => {
             // No fix yet on this connection: send status only — the platform
             // pins it to the vehicle's last known position.
             await up.report(imei, { ...(prevFix || {}), ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() });
-            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+            pending = (await applyCommands(imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
           // The device's text answer to an online command (no ack expected).
@@ -326,7 +336,7 @@ net.createServer((sock) => {
         } else {
           // heartbeat / alarms — ack so the device stays connected.
           sock.write(gt.ack(protocol, serial));
-          if (imei) pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+          if (imei) pending = (await applyCommands(imei, sendCmd, gt, speedNow())) || pending;
         }
         if (imei && prevFix) lastByImei.set(imei, { fix: prevFix, odo: odometerKm });
       }
