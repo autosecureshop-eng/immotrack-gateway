@@ -104,6 +104,29 @@ with `TRACKER_GATEWAY_KEY`.
 `npm test` runs the protocol decoders and the upstream error handling offline
 (no network needed).
 
+## Two trackers can share an IMEI
+
+Cheap GT06-family units ship with cloned or recycled IMEIs, so the digits do
+**not** identify one physical tracker. Everything the gateway keeps per device
+is keyed on **(protocol, imei)** — `gt06:8651…` and `teltonika:8651…` are two
+different trackers — and every `report` / `poll` / `ack` carries a `protocol`
+field alongside the IMEI.
+
+**The tracker API and the device page need the same key.** The `protocol` field
+is additive, so a function that ignores it behaves exactly as before — but
+until it keys on the pair, two trackers sharing an IMEI still land on one
+vehicle record and one command queue. Until that is done, give each install a
+distinct IMEI where you can.
+
+If two units with the same IMEI connect **on the same protocol**, the gateway
+cannot tell them apart at all. It logs
+
+```
+WARNING gt06:8651… already connected — replacing the earlier session
+```
+
+and keeps the newest connection. Treat that line as a fitting error.
+
 ## Commands stuck in the queue
 
 A command can only reach a device that is **currently connected**, so the first

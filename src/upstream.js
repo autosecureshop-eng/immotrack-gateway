@@ -2,6 +2,13 @@
 // server, so it authenticates with one shared GATEWAY_KEY (not a per-device
 // secret) and acts on behalf of whichever IMEI connected.
 //
+// Every call carries the PROTOCOL as well as the IMEI. Cheap GT06-family
+// units ship with cloned or recycled IMEIs, so the digits alone do not
+// identify one physical tracker; (protocol, imei) does. The field is additive
+// — a tracker function that ignores it behaves exactly as before — but until
+// the function and the device page key on the pair too, two trackers sharing
+// an IMEI will still land on one vehicle record.
+//
 // Every call here used to swallow HTTP errors. `fetch` only rejects on a
 // network failure, not on a 401/403/404/500, so a wrong TRACKER_GATEWAY_KEY
 // came back as `json.commands === undefined` -> an empty command list, and the
@@ -77,10 +84,10 @@ async function call(body) {
 }
 
 /** Push a position. Best-effort, but no longer silent. */
-async function report(imei, pos) {
+async function report(imei, pos, protocol) {
   try {
     await call({
-      action: "report", imei,
+      action: "report", imei, protocol,
       lat: pos.lat, lng: pos.lng, speed: pos.speed,
       heading: pos.heading, battery: pos.battery,
       ignition: pos.ignition, voltage: pos.voltage, odometer_km: pos.odometerKm,
@@ -90,7 +97,7 @@ async function report(imei, pos) {
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
     recovered("report");
-  } catch (e) { warn("report", `${imei}: ${e.message}`); }
+  } catch (e) { warn("report", `${protocol || "?"}:${imei}: ${e.message}`); }
 }
 
 /**
@@ -101,23 +108,23 @@ async function report(imei, pos) {
  * caller cannot tell the difference. That is exactly the bug this file used to
  * have, and it is why the failure is logged loudly here instead.
  */
-async function poll(imei) {
+async function poll(imei, protocol) {
   try {
-    const { json } = await call({ action: "poll", imei });
+    const { json } = await call({ action: "poll", imei, protocol });
     recovered("poll");
     return { commands: json.commands || [], timing: json.timing || null };
   } catch (e) {
-    warn("poll", `${imei}: ${e.message} — queued commands cannot be delivered`);
+    warn("poll", `${protocol || "?"}:${imei}: ${e.message} — queued commands cannot be delivered`);
     return { commands: [], timing: null };
   }
 }
 
 /** Report a command result. */
-async function ack(imei, commandId, ok, result) {
+async function ack(imei, commandId, ok, result, protocol) {
   try {
-    await call({ action: "ack", imei, command_id: commandId, ok, result });
+    await call({ action: "ack", imei, command_id: commandId, ok, result, protocol });
     recovered("ack");
-  } catch (e) { warn("ack", `${imei}: ${e.message}`); }
+  } catch (e) { warn("ack", `${protocol || "?"}:${imei}: ${e.message}`); }
 }
 
 /**
