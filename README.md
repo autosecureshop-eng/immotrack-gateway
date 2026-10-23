@@ -80,5 +80,34 @@ with `TRACKER_GATEWAY_KEY`.
 | `TRACKER_GATEWAY_KEY` | shared secret; must equal the function secret of the same name |
 | `TELTONIKA_PORT` / `GT06_PORT` | listeners (default 5027 / 5023) |
 | `LIVE_PERIOD_S` | reporting period while Live is on (default 5) |
+| `COMMAND_POLL_S` | how often a connected device's command queue is flushed (default 20; `0` disables the timer and reverts to flushing only when the device sends something) |
 
-`npm test` runs the protocol decoders offline (no network needed).
+`npm test` runs the protocol decoders and the upstream error handling offline
+(no network needed).
+
+## Commands stuck in the queue
+
+A command can only reach a device that is **currently connected**, so the first
+question is whether the unit is online — a parked tracker on the default
+`off=300` may simply not be talking yet. While it is connected the queue is
+flushed every `COMMAND_POLL_S` seconds, so it should not wait for the next
+heartbeat.
+
+If a device is plainly online and reporting positions but commands never go:
+
+```bash
+journalctl -u immotrack-gw -f
+```
+
+- **`[upstream] poll … TRACKER_GATEWAY_KEY …`** — the tracker API is rejecting
+  this gateway. `TRACKER_GATEWAY_KEY` in `/opt/immotrack/.env` must equal the
+  Edge Function secret of the same name. Nothing can be delivered until it does.
+- **`[upstream] … SUPABASE_URL`** — wrong project URL in `.env`.
+- **`[upstream] NOT CONFIGURED`** at startup — `.env` is missing values.
+- **`command sent: …`** — the gateway did send it; if the vehicle did not
+  respond, look at the command's `ack` text in the portal for the device's own
+  reply.
+
+A rejected API call used to be invisible: `fetch` does not throw on a 401, so a
+wrong key looked exactly like an empty queue. It is now logged on the first
+failure, then once a minute with a count, and again when it recovers.

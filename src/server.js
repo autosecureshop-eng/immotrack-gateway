@@ -98,6 +98,50 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
   return sent;
 }
 
+// ---- live sessions, so the queue can be flushed on a clock -------------------
+//
+// applyCommands used to run only when a device sent us a packet, so a queued
+// command waited for the vehicle's next heartbeat — up to 5 minutes on the
+// default off=300, and longer if it was asleep. The device still has to be
+// connected (we cannot push to a unit that is not), but while it IS connected
+// there is no reason to make the fitter wait for the next report.
+
+/** imei -> { send, dialect, speed(), setPending() } for every connected device. */
+const sessions = new Map();
+const inFlight = new Set(); // guards against a timer tick racing a packet
+
+const COMMAND_POLL_S = Number(process.env.COMMAND_POLL_S || 20);
+
+function openSession(imei, session) {
+  if (!imei) return null;
+  sessions.set(imei, session);
+  return session;
+}
+
+function closeSession(imei, session) {
+  if (imei && sessions.get(imei) === session) sessions.delete(imei);
+}
+
+/** Flush one connected device's queue. Shared by the timer and the packet path. */
+async function flush(imei, session) {
+  if (inFlight.has(imei)) return;
+  inFlight.add(imei);
+  try {
+    const sent = await applyCommands(imei, session.send, session.dialect, session.speed());
+    if (sent) session.setPending(sent);
+  } catch (e) {
+    log("command flush failed", imei, e.message);
+  } finally {
+    inFlight.delete(imei);
+  }
+}
+
+if (COMMAND_POLL_S > 0) {
+  setInterval(() => {
+    for (const [imei, session] of sessions) flush(imei, session);
+  }, COMMAND_POLL_S * 1000);
+}
+
 /**
  * A device's text reply. Attach it to the pending command's ack; if that
  * command was locate_now, turn the reply into a position report.
@@ -120,6 +164,8 @@ net.createServer((sock) => {
   let imei = null;
   let lastSpeed = null;
   let pending = null; // last command sent, awaiting the device's Codec 12 reply
+  let session = null;
+  sock.on("close", () => closeSession(imei, session));
   sock.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     try {
@@ -130,6 +176,12 @@ net.createServer((sock) => {
         buf = buf.subarray(2 + got.length);
         sock.write(tel.IMEI_ACCEPT);
         log("teltonika login", imei, sock.remoteAddress);
+        session = openSession(imei, {
+          send: (t) => sock.write(tel.buildCommand(t)),
+          dialect: tel,
+          speed: () => lastSpeed,
+          setPending: (p) => { pending = p; },
+        });
         return;
       }
       let pkt;
@@ -178,6 +230,8 @@ net.createServer((sock) => {
   const VOLT_POLL_MS = 90_000, VOLT_TRUST_MS = 20 * 60_000;
   const sendCmd = (t) => sock.write(gt.buildCommand(t));
   const askVoltage = () => { sendCmd("POWERLEVEL#"); voltAskedAt = Date.now(); };
+  let session = null;
+  sock.on("close", () => closeSession(imei, session));
   sock.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     try {
@@ -191,7 +245,15 @@ net.createServer((sock) => {
           imei = gt.parseLogin(content);
           sock.write(gt.ack(protocol, serial));
           log("gt06 login", imei, sock.remoteAddress);
-          if (imei) { askVoltage(); setTimeout(() => { try { if (realVolt == null) askVoltage(); } catch (_e) {} }, 15_000); }  // retry — GS900 often ignores the first POWERLEVEL#
+          if (imei) {
+            askVoltage();
+            setTimeout(() => { try { if (realVolt == null) askVoltage(); } catch (_e) {} }, 15_000);  // retry — GS900 often ignores the first POWERLEVEL#
+            session = openSession(imei, {
+              send: sendCmd, dialect: gt,
+              speed: () => lastSpeed,
+              setPending: (p) => { pending = p; },
+            });
+          }
           // A GT06 reboots when its power comes back; carry the last fix and
           // odometer over so its first heartbeats (before a new GPS fix) still
           // reach the platform — power/ignition changes show straight away.
@@ -271,5 +333,8 @@ net.createServer((sock) => {
   });
   sock.on("error", () => {});
 }).listen(GT06_PORT, () => log("GT06 gateway on", GT06_PORT));
+
+up.checkConfig();
+log("command queue polled every", COMMAND_POLL_S + "s while a device is connected");
 
 process.on("uncaughtException", (e) => log("uncaught", e.message));
