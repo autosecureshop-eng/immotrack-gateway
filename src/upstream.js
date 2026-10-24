@@ -110,6 +110,12 @@ async function call(body) {
 
 /** Push a position. Best-effort, but no longer silent. */
 async function report(imei, pos, protocol) {
+  const who = `${protocol || "?"}:${imei}`;
+  // A device the platform does not know is not worth reporting to it either —
+  // the fix would 404 just like the poll. Stay quiet until the back-off lifts;
+  // a successful report below clears it, so a newly-registered device resumes
+  // on its own.
+  if (isQuiet(who)) return false;
   try {
     await call({
       action: "report", imei, protocol,
@@ -140,9 +146,14 @@ async function report(imei, pos, protocol) {
       ext_power: pos.extPower, alarm: pos.alarm,
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
-    recovered(`report ${protocol || "?"}:${imei}`);
+    clearUnknown("report", who);
+    recovered("report " + who);
     return true;
-  } catch (e) { warn(`report ${protocol || "?"}:${imei}`, e.message); return false; }
+  } catch (e) {
+    if (e.unknownTracker) { markUnknown("report", who, e.message); return false; }
+    warn("report " + who, e.message);
+    return false;
+  }
 }
 
 /**
@@ -154,30 +165,33 @@ async function report(imei, pos, protocol) {
  * have, and it is why the failure is logged loudly here instead.
  */
 // IMEIs the API has disowned, and when it is worth asking about them again.
+// Shared by poll AND report: a device the platform does not know keeps its TCP
+// session open and goes on sending position reports, so without this the
+// report path logged a 404 for every fix for as long as the unit stayed
+// powered — which is exactly what a tracker moved to another account, or one
+// left switched on at the fitter's bench, does.
 const unknownUntil = new Map();
+const isQuiet = (who) => { const t = unknownUntil.get(who); return t != null && Date.now() < t; };
+function markUnknown(path, who, msg) {
+  unknownUntil.set(who, Date.now() + UNKNOWN_BACKOFF_MS);
+  console.error("[upstream]", path, who, msg,
+    `— not contacting the platform about it for ${Math.round(UNKNOWN_BACKOFF_MS / 60_000)} min`);
+}
+function clearUnknown(path, who) {
+  if (unknownUntil.delete(who)) console.log("[upstream]", path, who, "is registered now — resumed");
+}
 
 async function poll(imei, protocol) {
   const who = `${protocol || "?"}:${imei}`;
-  const quiet = unknownUntil.get(who);
-  if (quiet && Date.now() < quiet) return { commands: [], timing: null };
+  if (isQuiet(who)) return { commands: [], timing: null };
 
   try {
     const { json } = await call({ action: "poll", imei, protocol });
-    if (unknownUntil.delete(who)) {
-      console.log("[upstream]", "poll", who, "is registered now — polling resumed");
-    }
+    clearUnknown("poll", who);
     recovered("poll " + who);
     return { commands: json.commands || [], timing: json.timing || null };
   } catch (e) {
-    if (e.unknownTracker) {
-      // Not a fault to retry hard: nothing on this gateway can fix it, and
-      // only registering the IMEI on the platform will. Say so once, then go
-      // quiet rather than filling the journal for as long as it stays plugged in.
-      unknownUntil.set(who, Date.now() + UNKNOWN_BACKOFF_MS);
-      console.error("[upstream]", "poll", who, e.message,
-        `— not asking again for ${Math.round(UNKNOWN_BACKOFF_MS / 60_000)} min`);
-      return { commands: [], timing: null };
-    }
+    if (e.unknownTracker) { markUnknown("poll", who, e.message); return { commands: [], timing: null }; }
     warn("poll " + who, `${e.message} — queued commands cannot be delivered`);
     return { commands: [], timing: null };
   }

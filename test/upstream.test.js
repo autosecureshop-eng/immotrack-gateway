@@ -117,7 +117,7 @@ test("an unknown tracker is asked about once, then left alone", async () => {
   const first = await withFetch(404, { error: "unknown tracker" },
     () => up.poll(imei, "gt06"));
   assert.equal(first.errors.length, 1, "say it once");
-  assert.match(first.errors[0], /not asking again/);
+  assert.match(first.errors[0], /not contacting the platform/);
 
   // Every later poll inside the back-off window must be silent, and must not
   // even reach the API.
@@ -179,4 +179,22 @@ test("report says whether it landed, so distance is not thrown away", async () =
     () => up.report("123456789012345", { lat: 1, lng: 2, tripKm: 1 }, "gt06"));
   assert.equal(bad.result, false,
     "a failed report must say so — the caller keeps the km for the next attempt");
+});
+
+test("report backs off an unknown tracker, like poll", async () => {
+  const imei = "555555555555555";
+  const first = await withFetch(404, { error: "unknown tracker" },
+    () => up.report(imei, { lat: 1, lng: 2 }, "gt06"));
+  assert.equal(first.result, false, "a 404 report is not success");
+  assert.equal(first.errors.length, 1, "say it once");
+
+  // A live device keeps sending fixes; those must not each log a 404.
+  let noise = 0;
+  for (let i = 0; i < 5; i++) {
+    const again = await withFetch(404, { error: "unknown tracker" },
+      () => up.report(imei, { lat: 1, lng: 2 }, "gt06"));
+    noise += again.errors.length;
+    assert.equal(again.result, false);
+  }
+  assert.equal(noise, 0, "no further 404s for a device the platform disowned");
 });
