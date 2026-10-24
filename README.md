@@ -46,6 +46,7 @@ Watch it: `journalctl -u immotrack-gw -f`.
 | `locate_now` (panel open / Locate) | `getgps` → reply parsed into a position | `WHERE#` → reply parsed |
 | `set_timing` `on=20,off=300` (heartbeat) | `setparam` moving & stopped Min/Send periods (home, roaming, unknown) | `TIMER,20,300#` |
 | `live_on` / `live_off` (Live toggle) | periods → 5 s / back to the vehicle's timing | `TIMER,5,5#` / `TIMER,on,off#` |
+| `clear_cache` | *not supported* | `BACKUP,0#` |
 | `custom` | text as typed | text as typed |
 
 Teltonika period IDs used: moving 10050/10055 (+100 roaming, +200 unknown),
@@ -53,8 +54,25 @@ stopped 10000/10005 (+100/+200). Reporting while parked also needs Sleep Mode
 (param 102) left at 0 or GPS-sleep. Check a device's reply in the command result
 if a firmware behaves differently.
 
-- **Safety:** remote immobilise is held if the last known speed shows the vehicle
-  moving; it only ever prevents the next start. The tracker API enforces the same.
+- **`clear_cache`** drops a GT06's blind-spot buffer. A unit that has been out
+  of GPRS for a long time replays its cached fixes on reconnect, which arrive at
+  the platform as a trail the vehicle drove hours ago; `BACKUP,0#` turns the
+  buffer off and discards it. **Destructive** — anything cached and not yet
+  uploaded is lost. Teltonika has no equivalent and answers "not supported by
+  this device".
+
+- **Safety:** remote immobilise is only sent when a **recent** speed reading
+  shows the vehicle slow enough — `src/safety.js`, tested in
+  `test/safety.test.js`. Unknown is not stationary and stale is not now, so a
+  cut is **held** when there is no reading yet on the connection, or the last
+  one is older than `SPEED_FRESH_MS`. The gateway asks the device for a fix at
+  the same time, so a retry succeeds seconds later. `mobilise` is never held.
+
+  This matters because `lastSpeed` starts null on every TCP connection: a unit
+  reconnecting mid-journey — out of a tunnel, back into signal — has no reading
+  at all. The API's check happens when the command is *queued*, so it cannot
+  cover a car that drove off afterwards. The gateway is the last guard before
+  the relay.
 
 ## Point each tracker at the gateway
 
@@ -80,5 +98,58 @@ with `TRACKER_GATEWAY_KEY`.
 | `TRACKER_GATEWAY_KEY` | shared secret; must equal the function secret of the same name |
 | `TELTONIKA_PORT` / `GT06_PORT` | listeners (default 5027 / 5023) |
 | `LIVE_PERIOD_S` | reporting period while Live is on (default 5) |
+| `COMMAND_POLL_S` | how often a connected device's command queue is flushed (default 5; `0` disables the timer and reverts to flushing only when the device sends something) |
+| `SPEED_FRESH_MS` | how long a speed reading counts as current for the immobilise guard (default 90000) |
 
-`npm test` runs the protocol decoders offline (no network needed).
+`npm test` runs the protocol decoders and the upstream error handling offline
+(no network needed).
+
+## Two trackers can share an IMEI
+
+Cheap GT06-family units ship with cloned or recycled IMEIs, so the digits do
+**not** identify one physical tracker. Everything the gateway keeps per device
+is keyed on **(protocol, imei)** — `gt06:8651…` and `teltonika:8651…` are two
+different trackers — and every `report` / `poll` / `ack` carries a `protocol`
+field alongside the IMEI.
+
+**The tracker API and the device page need the same key.** The `protocol` field
+is additive, so a function that ignores it behaves exactly as before — but
+until it keys on the pair, two trackers sharing an IMEI still land on one
+vehicle record and one command queue. Until that is done, give each install a
+distinct IMEI where you can.
+
+If two units with the same IMEI connect **on the same protocol**, the gateway
+cannot tell them apart at all. It logs
+
+```
+WARNING gt06:8651… already connected — replacing the earlier session
+```
+
+and keeps the newest connection. Treat that line as a fitting error.
+
+## Commands stuck in the queue
+
+A command can only reach a device that is **currently connected**, so the first
+question is whether the unit is online — a parked tracker on the default
+`off=300` may simply not be talking yet. While it is connected the queue is
+flushed every `COMMAND_POLL_S` seconds, so it should not wait for the next
+heartbeat.
+
+If a device is plainly online and reporting positions but commands never go:
+
+```bash
+journalctl -u immotrack-gw -f
+```
+
+- **`[upstream] poll … TRACKER_GATEWAY_KEY …`** — the tracker API is rejecting
+  this gateway. `TRACKER_GATEWAY_KEY` in `/opt/immotrack/.env` must equal the
+  Edge Function secret of the same name. Nothing can be delivered until it does.
+- **`[upstream] … SUPABASE_URL`** — wrong project URL in `.env`.
+- **`[upstream] NOT CONFIGURED`** at startup — `.env` is missing values.
+- **`command sent: …`** — the gateway did send it; if the vehicle did not
+  respond, look at the command's `ack` text in the portal for the device's own
+  reply.
+
+A rejected API call used to be invisible: `fetch` does not throw on a 401, so a
+wrong key looked exactly like an empty queue. It is now logged on the first
+failure, then once a minute with a count, and again when it recovers.

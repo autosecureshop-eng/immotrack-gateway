@@ -25,11 +25,10 @@ const net = require("net");
 const tel = require("./teltonika");
 const gt = require("./gt06");
 const up = require("./upstream");
+const safety = require("./safety");
 
 const TELTONIKA_PORT = Number(process.env.TELTONIKA_PORT || 5027);
 const GT06_PORT = Number(process.env.GT06_PORT || 5023);
-const MOVING_KMH = 3;
-const INSTANT_KMH = 32; // 20 mph — consented instant cut ceiling
 const LIVE_S = Number(process.env.LIVE_PERIOD_S || 5); // reporting period while Live is on
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
@@ -55,16 +54,23 @@ function parseTiming(arg) {
  * Returns the last command sent ({id, command}) so the caller can attach the
  * device's text reply to its ack, or null if nothing was sent.
  */
-async function applyCommands(imei, send, dialect, lastSpeed) {
-  const { commands, timing } = await up.poll(imei);
+async function applyCommands(imei, send, dialect, speed, protocol) {
+  const { commands, timing } = await up.poll(imei, protocol);
   let sent = null;
+  let askedForFix = false;
   for (const c of commands) {
-    // Safe immobilise waits for a stationary vehicle; "instant" (consented, hire-fleet
-    // style, tracker-only) may cut at or under 20 mph (32 km/h) — never faster.
-    const limit = c.command === "immobilise_instant" ? INSTANT_KMH : c.command === "immobilise" ? MOVING_KMH : null;
-    if (limit != null && lastSpeed != null && lastSpeed > limit) {
-      await up.ack(imei, c.id, false, `held: vehicle moving (${Math.round(lastSpeed)} km/h > ${limit})`);
-      log(imei, "HELD", c.command, "— moving", lastSpeed);
+    // Whether this may be sent at all is decided in src/safety.js — unknown
+    // speed is not a stationary vehicle, and a stale reading is not "now".
+    const hold = safety.holdCheck(c.command, speed);
+    if (hold) {
+      // For unknown or stale, ask for a fix so the operator's retry succeeds
+      // in seconds rather than waiting on the vehicle's reporting interval.
+      if (hold.askFix && !askedForFix && dialect.locateText) {
+        try { send(dialect.locateText()); askedForFix = true; } catch (_e) { /* best effort */ }
+      }
+      const tail = hold.askFix ? " — asked the device for a fix, retry in a moment" : "";
+      await up.ack(imei, c.id, false, `held: ${hold.why}${tail}`, protocol);
+      log(imei, "HELD", c.command, "—", hold.why);
       continue;
     }
     try {
@@ -76,6 +82,10 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
         case "mobilise": text = (c.arg && c.arg.trim()) || dialect.immobiliseText(false); break;
         case "locate_now": text = dialect.locateText(); break;
         case "buzzer": text = dialect.buzzerText ? dialect.buzzerText() : null; break;
+        // Drops the device's un-uploaded blind-spot buffer, so a unit back from
+        // a long dead zone stops replaying hours-old fixes. Teltonika has no
+        // equivalent and falls through to "not supported by this device".
+        case "clear_cache": text = dialect.clearCacheText ? dialect.clearCacheText() : null; break;
         case "set_timing": { const t = parseTiming(c.arg); text = t ? dialect.timingText(t.on, t.off) : null; break; }
         case "live_on": text = dialect.timingText(LIVE_S, LIVE_S); break;
         case "live_off": text = dialect.timingText(timing?.on ?? 20, timing?.off ?? 300); break;
@@ -83,32 +93,103 @@ async function applyCommands(imei, send, dialect, lastSpeed) {
         default: text = null;
       }
       if (!text) {
-        await up.ack(imei, c.id, false, "not supported by this device");
+        await up.ack(imei, c.id, false, "not supported by this device", protocol);
         log(imei, "unsupported command", c.command);
         continue;
       }
       send(text);
-      await up.ack(imei, c.id, true, "sent: " + text.slice(0, 120));
+      await up.ack(imei, c.id, true, "sent: " + text.slice(0, 120), protocol);
       sent = { id: c.id, command: c.command };
       log(imei, "command sent:", c.command, text.length > 70 ? text.slice(0, 70) + "…" : text);
     } catch (e) {
-      await up.ack(imei, c.id, false, e.message);
+      await up.ack(imei, c.id, false, e.message, protocol);
     }
   }
   return sent;
+}
+
+// ---- live sessions, so the queue can be flushed on a clock -------------------
+//
+// applyCommands used to run only when a device sent us a packet, so a queued
+// command waited for the vehicle's next heartbeat — up to 5 minutes on the
+// default off=300, and longer if it was asleep. The device still has to be
+// connected (we cannot push to a unit that is not), but while it IS connected
+// there is no reason to make the fitter wait for the next report.
+
+// An IMEI is NOT a unique key here. Cheap GT06-family units ship with cloned
+// or recycled IMEIs, so two different trackers — on different protocols, in
+// different vehicles — can legitimately present the same digits. Keying this
+// registry on the IMEI alone meant the second one to connect replaced the
+// first, and the first silently stopped getting its queue flushed.
+//
+// Everything per-device is therefore keyed by protocol AND imei.
+
+/** "gt06:35…" -> { send, dialect, speed(), setPending() } per connected device. */
+const sessions = new Map();
+const inFlight = new Set(); // guards against a timer tick racing a packet
+
+const COMMAND_POLL_S = Number(process.env.COMMAND_POLL_S || 5);
+
+/** The key for one physical tracker. */
+const deviceKey = (protocol, imei) => `${protocol}:${imei}`;
+
+function openSession(protocol, imei, session) {
+  if (!imei) return null;
+  const key = deviceKey(protocol, imei);
+  const existing = sessions.get(key);
+  if (existing) {
+    // Same protocol AND same IMEI: either a reconnect whose old socket has not
+    // closed yet, or two units genuinely cloned onto one IMEI. Either way the
+    // newest connection is the one that can be written to, but say so — a pair
+    // of clones on one protocol is a fitting error nobody will otherwise spot.
+    log("WARNING", key, "already connected — replacing the earlier session;",
+        "if both units are live, they share an IMEI on the same protocol and",
+        "cannot be told apart");
+  }
+  sessions.set(key, { ...session, protocol, imei, key });
+  return sessions.get(key);
+}
+
+function closeSession(protocol, imei, session) {
+  if (!imei || !session) return;
+  const key = deviceKey(protocol, imei);
+  if (sessions.get(key) === session) sessions.delete(key);
+}
+
+/** Flush one connected device's queue. Shared by the timer and the packet path. */
+async function flush(session) {
+  if (!session) return;
+  const { key, imei, protocol } = session;
+  if (inFlight.has(key)) return;
+  inFlight.add(key);
+  try {
+    const sent = await applyCommands(imei, session.send, session.dialect,
+                                     session.speed(), protocol);
+    if (sent) session.setPending(sent);
+  } catch (e) {
+    log("command flush failed", key, e.message);
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+if (COMMAND_POLL_S > 0) {
+  setInterval(() => {
+    for (const session of sessions.values()) flush(session);
+  }, COMMAND_POLL_S * 1000);
 }
 
 /**
  * A device's text reply. Attach it to the pending command's ack; if that
  * command was locate_now, turn the reply into a position report.
  */
-async function handleReply(imei, pending, text, parsePos) {
+async function handleReply(imei, pending, text, parsePos, protocol) {
   log(imei, "device reply:", text.slice(0, 120));
   if (!pending) return null;
-  await up.ack(imei, pending.id, true, text.slice(0, 200));
+  await up.ack(imei, pending.id, true, text.slice(0, 200), protocol);
   if (pending.command === "locate_now") {
     const pos = parsePos(text);
-    if (pos) await up.report(imei, pos);
+    if (pos) await up.report(imei, pos, protocol);
   }
   return null;
 }
@@ -120,6 +201,10 @@ net.createServer((sock) => {
   let imei = null;
   let lastSpeed = null;
   let pending = null; // last command sent, awaiting the device's Codec 12 reply
+  let lastSpeedAt = null;
+  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt });
+  let session = null;
+  sock.on("close", () => closeSession("teltonika", imei, session));
   sock.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     try {
@@ -130,6 +215,12 @@ net.createServer((sock) => {
         buf = buf.subarray(2 + got.length);
         sock.write(tel.IMEI_ACCEPT);
         log("teltonika login", imei, sock.remoteAddress);
+        session = openSession("teltonika", imei, {
+          send: (t) => sock.write(tel.buildCommand(t)),
+          dialect: tel,
+          speed: speedNow,
+          setPending: (p) => { pending = p; },
+        });
         return;
       }
       let pkt;
@@ -137,14 +228,14 @@ net.createServer((sock) => {
         buf = buf.subarray(pkt.consumed);
         if (pkt.response != null) {
           // Codec 12 reply to something we sent — no AVL ack for these.
-          pending = await handleReply(imei, pending, pkt.response, tel.parseGetGps);
+          pending = await handleReply(imei, pending, pkt.response, tel.parseGetGps, "teltonika");
           continue;
         }
         sock.write(tel.avlAck(pkt.count));
         for (const r of pkt.records) {
-          if (r.lat || r.lng) { lastSpeed = r.speed; await up.report(imei, r); }
+          if (r.lat || r.lng) { lastSpeed = r.speed; lastSpeedAt = Date.now(); await up.report(imei, r, "teltonika"); }
         }
-        pending = (await applyCommands(imei, (t) => sock.write(tel.buildCommand(t)), tel, lastSpeed)) || pending;
+        pending = (await applyCommands(imei, (t) => sock.write(tel.buildCommand(t)), tel, speedNow(), "teltonika")) || pending;
       }
     } catch (e) {
       log("teltonika error", imei, e.message);
@@ -156,7 +247,8 @@ net.createServer((sock) => {
 
 // ---- GT06 -------------------------------------------------------------------
 
-/** Last fix + odometer per IMEI, kept across reconnects (in memory). */
+/** Last fix + odometer per GT06 device, kept across reconnects (in memory).
+ *  Keyed with the protocol for the same reason the session registry is. */
 const lastByImei = new Map();
 
 net.createServer((sock) => {
@@ -178,6 +270,10 @@ net.createServer((sock) => {
   const VOLT_POLL_MS = 90_000, VOLT_TRUST_MS = 20 * 60_000;
   const sendCmd = (t) => sock.write(gt.buildCommand(t));
   const askVoltage = () => { sendCmd("POWERLEVEL#"); voltAskedAt = Date.now(); };
+  let lastSpeedAt = null;
+  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt });
+  let session = null;
+  sock.on("close", () => closeSession("gt06", imei, session));
   sock.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     try {
@@ -191,11 +287,19 @@ net.createServer((sock) => {
           imei = gt.parseLogin(content);
           sock.write(gt.ack(protocol, serial));
           log("gt06 login", imei, sock.remoteAddress);
-          if (imei) { askVoltage(); setTimeout(() => { try { if (realVolt == null) askVoltage(); } catch (_e) {} }, 15_000); }  // retry — GS900 often ignores the first POWERLEVEL#
+          if (imei) {
+            askVoltage();
+            setTimeout(() => { try { if (realVolt == null) askVoltage(); } catch (_e) {} }, 15_000);  // retry — GS900 often ignores the first POWERLEVEL#
+            session = openSession("gt06", imei, {
+              send: sendCmd, dialect: gt,
+              speed: speedNow,
+              setPending: (p) => { pending = p; },
+            });
+          }
           // A GT06 reboots when its power comes back; carry the last fix and
           // odometer over so its first heartbeats (before a new GPS fix) still
           // reach the platform — power/ignition changes show straight away.
-          const saved = lastByImei.get(imei);
+          const saved = lastByImei.get(deviceKey("gt06", imei));
           if (saved && !prevFix) { prevFix = { ...saved.fix, speed: 0 }; odometerKm = saved.odo; }
         } else if (protocol === gt.GPS_LBS_2 || protocol === gt.ALARM_1 || protocol === gt.ALARM_2) {
           // Alarm packet: position + status + the alarm that caused it (power
@@ -208,25 +312,25 @@ net.createServer((sock) => {
             const pos = (lat || lng) ? { lat, lng, time, speed, heading } : prevFix;
             if (alarm) log("gt06 alarm", imei, alarm, "ext=" + st.extPower);
             if (lat || lng) {
-              lastSpeed = speed;
+              lastSpeed = speed; lastSpeedAt = Date.now();
               if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
               prevFix = pos;
             }
             // Even with no fix at all the alarm still goes up (status-only report).
-            await up.report(imei, { ...(pos || {}), ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() });
-            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+            await up.report(imei, { ...(pos || {}), ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() }, "gt06");
+            pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
           }
         } else if (protocol === gt.GPS || protocol === gt.GPS_LBS) {
           sock.write(gt.ack(protocol, serial));
           if (imei) {
             const pos = gt.parseLocation(content);
             if (pos.lat || pos.lng) {
-              lastSpeed = pos.speed;
+              lastSpeed = pos.speed; lastSpeedAt = Date.now();
               if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
               prevFix = pos;
-              await up.report(imei, { ...pos, ...status, odometerKm: odometerKm ?? undefined });
+              await up.report(imei, { ...pos, ...status, odometerKm: odometerKm ?? undefined }, "gt06");
             }
-            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+            pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
           }
         } else if (protocol === gt.STATUS) {
           sock.write(gt.ack(protocol, serial));
@@ -244,8 +348,8 @@ net.createServer((sock) => {
             if (hbAlarm) log("gt06 status alarm", imei, hbAlarm);
             // No fix yet on this connection: send status only — the platform
             // pins it to the vehicle's last known position.
-            await up.report(imei, { ...(prevFix || {}), ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() });
-            pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+            await up.report(imei, { ...(prevFix || {}), ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() }, "gt06");
+            pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
           }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
           // The device's text answer to an online command (no ack expected).
@@ -254,15 +358,15 @@ net.createServer((sock) => {
           if (mv) {
             realVolt = parseFloat(mv[1]); realVoltAt = Date.now(); status.voltage = realVolt;
             log("gt06 voltage", imei, realVolt + "V");
-            if (imei) await up.report(imei, { ...(prevFix || {}), ...status, odometerKm: odometerKm ?? undefined, time: Date.now() });
+            if (imei) await up.report(imei, { ...(prevFix || {}), ...status, odometerKm: odometerKm ?? undefined, time: Date.now() }, "gt06");
           }
-          if (imei && (!mv || pending)) pending = await handleReply(imei, pending, text, gt.parseWhere);
+          if (imei && (!mv || pending)) pending = await handleReply(imei, pending, text, gt.parseWhere, "gt06");
         } else {
           // heartbeat / alarms — ack so the device stays connected.
           sock.write(gt.ack(protocol, serial));
-          if (imei) pending = (await applyCommands(imei, sendCmd, gt, lastSpeed)) || pending;
+          if (imei) pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
         }
-        if (imei && prevFix) lastByImei.set(imei, { fix: prevFix, odo: odometerKm });
+        if (imei && prevFix) lastByImei.set(deviceKey("gt06", imei), { fix: prevFix, odo: odometerKm });
       }
     } catch (e) {
       log("gt06 error", imei, e.message);
@@ -271,5 +375,8 @@ net.createServer((sock) => {
   });
   sock.on("error", () => {});
 }).listen(GT06_PORT, () => log("GT06 gateway on", GT06_PORT));
+
+up.checkConfig();
+log("command queue polled every", COMMAND_POLL_S + "s while a device is connected");
 
 process.on("uncaughtException", (e) => log("uncaught", e.message));
