@@ -190,21 +190,41 @@ function closeSession(protocol, imei, session) {
   if (sessions.get(key) === session) sessions.delete(key);
 }
 
-/** Flush one connected device's queue. Shared by the timer and the packet path. */
-async function flush(session) {
-  if (!session) return;
-  const { key, imei, protocol } = session;
-  if (inFlight.has(key)) return;
+/**
+ * Flush one device's queue, never twice at once.
+ *
+ * The guard is the whole point. `poll` reads the queued rows and then marks
+ * them sent in a second call, so two flushes that overlap both read the same
+ * row as queued and both send it. On the bench that showed up as a tracker
+ * answering "Cut off the fuel supply: Success!" and then, to the duplicate,
+ * "Already in the state of fuel supply cut off, the command is not running!"
+ * — the command worked and still looked like it had failed.
+ *
+ * Both callers must come through here: the timer AND the packet path. When
+ * only the timer held the guard it protected nothing, because the race it was
+ * written for is precisely a tick landing on top of an arriving packet.
+ */
+async function flushDevice(protocol, imei, send, dialect, speed) {
+  if (!imei) return null;
+  const key = deviceKey(protocol, imei);
+  if (inFlight.has(key)) return null;
   inFlight.add(key);
   try {
-    const sent = await applyCommands(imei, session.send, session.dialect,
-                                     session.speed(), protocol);
-    if (sent) session.setPending(sent);
+    return await applyCommands(imei, send, dialect, speed, protocol);
   } catch (e) {
     log("command flush failed", key, e.message);
+    return null;
   } finally {
     inFlight.delete(key);
   }
+}
+
+/** Flush from the timer, for a registered session. */
+async function flush(session) {
+  if (!session) return;
+  const sent = await flushDevice(session.protocol, session.imei, session.send,
+                                 session.dialect, session.speed());
+  if (sent) session.setPending(sent);
 }
 
 if (COMMAND_POLL_S > 0) {
@@ -277,7 +297,7 @@ net.createServer((sock) => {
           noteIgnition(r.ignition);
           if (r.lat || r.lng) { lastSpeed = r.speed; lastSpeedAt = Date.now(); await up.report(imei, r, "teltonika"); }
         }
-        pending = (await applyCommands(imei, (t) => sock.write(tel.buildCommand(t)), tel, speedNow(), "teltonika")) || pending;
+        pending = (await flushDevice("teltonika", imei, (t) => sock.write(tel.buildCommand(t)), tel, speedNow())) || pending;
       }
     } catch (e) {
       log("teltonika error", imei, e.message);
@@ -365,7 +385,7 @@ net.createServer((sock) => {
             }
             // Even with no fix at all the alarm still goes up (status-only report).
             await up.report(imei, { ...(pos || {}), ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() }, "gt06");
-            pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
+            pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.GPS || protocol === gt.GPS_LBS) {
           sock.write(gt.ack(protocol, serial));
@@ -377,7 +397,7 @@ net.createServer((sock) => {
               prevFix = pos;
               await up.report(imei, { ...pos, ...status, odometerKm: odometerKm ?? undefined }, "gt06");
             }
-            pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
+            pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.STATUS) {
           sock.write(gt.ack(protocol, serial));
@@ -397,7 +417,7 @@ net.createServer((sock) => {
             // No fix yet on this connection: send status only — the platform
             // pins it to the vehicle's last known position.
             await up.report(imei, { ...(prevFix || {}), ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() }, "gt06");
-            pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
+            pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
           // The device's text answer to an online command (no ack expected).
@@ -412,7 +432,7 @@ net.createServer((sock) => {
         } else {
           // heartbeat / alarms — ack so the device stays connected.
           sock.write(gt.ack(protocol, serial));
-          if (imei) pending = (await applyCommands(imei, sendCmd, gt, speedNow(), "gt06")) || pending;
+          if (imei) pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
         }
         if (imei && prevFix) lastByImei.set(deviceKey("gt06", imei), { fix: prevFix, odo: odometerKm });
       }
