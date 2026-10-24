@@ -202,7 +202,12 @@ net.createServer((sock) => {
   let lastSpeed = null;
   let pending = null; // last command sent, awaiting the device's Codec 12 reply
   let lastSpeedAt = null;
-  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt });
+  // Ignition is tracked apart from speed because it arrives without a GPS fix,
+  // which is what lets a jammed or underground vehicle still be immobilised.
+  // See the note at the top of src/safety.js.
+  let lastIgnition = null, lastIgnitionAt = null;
+  const noteIgnition = (on) => { if (on != null) { lastIgnition = !!on; lastIgnitionAt = Date.now(); } };
+  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt, ignition: lastIgnition, ignitionAt: lastIgnitionAt });
   let session = null;
   sock.on("close", () => closeSession("teltonika", imei, session));
   sock.on("data", async (chunk) => {
@@ -233,6 +238,9 @@ net.createServer((sock) => {
         }
         sock.write(tel.avlAck(pkt.count));
         for (const r of pkt.records) {
+          // Ignition (IO 239) is on the record whether or not the fix is
+          // valid, so take it from every record — not only the ones we report.
+          noteIgnition(r.ignition);
           if (r.lat || r.lng) { lastSpeed = r.speed; lastSpeedAt = Date.now(); await up.report(imei, r, "teltonika"); }
         }
         pending = (await applyCommands(imei, (t) => sock.write(tel.buildCommand(t)), tel, speedNow(), "teltonika")) || pending;
@@ -271,7 +279,11 @@ net.createServer((sock) => {
   const sendCmd = (t) => sock.write(gt.buildCommand(t));
   const askVoltage = () => { sendCmd("POWERLEVEL#"); voltAskedAt = Date.now(); };
   let lastSpeedAt = null;
-  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt });
+  // As on the Teltonika side: ignition is kept separately because the GT06
+  // status frame carries it with no position at all. See src/safety.js.
+  let lastIgnition = null, lastIgnitionAt = null;
+  const noteIgnition = (on) => { if (on != null) { lastIgnition = !!on; lastIgnitionAt = Date.now(); } };
+  const speedNow = () => ({ kmh: lastSpeed, at: lastSpeedAt, ignition: lastIgnition, ignitionAt: lastIgnitionAt });
   let session = null;
   sock.on("close", () => closeSession("gt06", imei, session));
   sock.on("data", async (chunk) => {
@@ -309,6 +321,7 @@ net.createServer((sock) => {
             const a = gt.parseAlarm(content);
             const { alarm, lat, lng, time, speed, heading, ...st } = a;
             if (st.ignition != null) status = { ...status, ...st };
+            noteIgnition(st.ignition);
             const pos = (lat || lng) ? { lat, lng, time, speed, heading } : prevFix;
             if (alarm) log("gt06 alarm", imei, alarm, "ext=" + st.extPower);
             if (lat || lng) {
@@ -337,6 +350,7 @@ net.createServer((sock) => {
           const { alarm: hbAlarm, ...st } = gt.parseStatus(content);
           if (st.extPower !== status.extPower) { log("gt06 ext power", imei, st.extPower ? "connected" : "disconnected", "info=0x" + (content[0] ?? 0).toString(16)); askVoltage(); }
           status = st;
+          noteIgnition(st.ignition);
           if (realVolt != null && Date.now() - realVoltAt < VOLT_TRUST_MS) status.voltage = realVolt;
           if (!pending && Date.now() - voltAskedAt > VOLT_POLL_MS) askVoltage();
           // The status frame carries fresh GSM signal / voltage / ignition /
