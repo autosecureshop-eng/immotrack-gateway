@@ -112,22 +112,19 @@ test("a 404 'unknown tracker' does not blame SUPABASE_URL", async () => {
     "the URL is fine — saying otherwise sends people to check a correct setting");
 });
 
-test("an unknown tracker is asked about once, then left alone", async () => {
+test("poll NEVER backs off — a command must always get its chance", async () => {
+  // Safety-critical: poll is how an immobilise reaches the vehicle, so it must
+  // try on every cycle even for a device the platform keeps 404ing. (The log
+  // is throttled by warn(); the API call itself is not skipped.) The earlier
+  // design backed poll off for ten minutes, which could sit on a real cut.
   const imei = "222222222222222";
-  const first = await withFetch(404, { error: "unknown tracker" },
-    () => up.poll(imei, "gt06"));
-  assert.equal(first.errors.length, 1, "say it once");
-  assert.match(first.errors[0], /not contacting the platform/);
-
-  // Every later poll inside the back-off window must be silent, and must not
-  // even reach the API.
-  let calls = 0;
-  for (let i = 0; i < 5; i++) {
-    const again = await withFetch(404, { error: "unknown tracker" },
-      () => up.poll(imei, "gt06"));
-    calls += again.errors.length;
+  let reached = 0;
+  for (let i = 0; i < 6; i++) {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => { reached++; return { ok: false, status: 404, text: async () => JSON.stringify({ error: "unknown tracker" }) }; };
+    try { await up.poll(imei, "gt06"); } finally { globalThis.fetch = realFetch; }
   }
-  assert.equal(calls, 0, "no further noise while it stays unregistered");
+  assert.equal(reached, 6, "every poll must reach the API, so a just-registered device is served at once");
 });
 
 test("one device's failure does not reset another's throttle", async () => {
@@ -181,7 +178,7 @@ test("report says whether it landed, so distance is not thrown away", async () =
     "a failed report must say so — the caller keeps the km for the next attempt");
 });
 
-test("report backs off an unknown tracker, like poll", async () => {
+test("report backs off an unknown tracker (its own back-off, not shared with poll)", async () => {
   const imei = "555555555555555";
   const first = await withFetch(404, { error: "unknown tracker" },
     () => up.report(imei, { lat: 1, lng: 2 }, "gt06"));

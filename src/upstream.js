@@ -111,11 +111,11 @@ async function call(body) {
 /** Push a position. Best-effort, but no longer silent. */
 async function report(imei, pos, protocol) {
   const who = `${protocol || "?"}:${imei}`;
-  // A device the platform does not know is not worth reporting to it either —
-  // the fix would 404 just like the poll. Stay quiet until the back-off lifts;
-  // a successful report below clears it, so a newly-registered device resumes
-  // on its own.
-  if (isQuiet(who)) return false;
+  // A device the platform does not know is not worth reporting to — the fix
+  // would 404 on every heartbeat. Stay quiet until the back-off lifts; a
+  // successful report clears it, so a newly-registered device resumes on its
+  // own. This back-off is report's alone; it never touches command polling.
+  if (isReportQuiet(who)) return false;
   try {
     await call({
       action: "report", imei, protocol,
@@ -146,11 +146,16 @@ async function report(imei, pos, protocol) {
       ext_power: pos.extPower, alarm: pos.alarm,
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
-    clearUnknown("report", who);
+    if (reportQuiet.delete(who)) console.log("[upstream]", "report", who, "is registered now — resumed");
     recovered("report " + who);
     return true;
   } catch (e) {
-    if (e.unknownTracker) { markUnknown("report", who, e.message); return false; }
+    if (e.unknownTracker) {
+      reportQuiet.set(who, Date.now() + UNKNOWN_BACKOFF_MS);
+      console.error("[upstream]", "report", who, e.message,
+        `— not reporting it for ${Math.round(UNKNOWN_BACKOFF_MS / 60_000)} min (does not affect commands)`);
+      return false;
+    }
     warn("report " + who, e.message);
     return false;
   }
@@ -164,34 +169,30 @@ async function report(imei, pos, protocol) {
  * caller cannot tell the difference. That is exactly the bug this file used to
  * have, and it is why the failure is logged loudly here instead.
  */
-// IMEIs the API has disowned, and when it is worth asking about them again.
-// Shared by poll AND report: a device the platform does not know keeps its TCP
-// session open and goes on sending position reports, so without this the
-// report path logged a 404 for every fix for as long as the unit stayed
-// powered — which is exactly what a tracker moved to another account, or one
-// left switched on at the fitter's bench, does.
-const unknownUntil = new Map();
-const isQuiet = (who) => { const t = unknownUntil.get(who); return t != null && Date.now() < t; };
-function markUnknown(path, who, msg) {
-  unknownUntil.set(who, Date.now() + UNKNOWN_BACKOFF_MS);
-  console.error("[upstream]", path, who, msg,
-    `— not contacting the platform about it for ${Math.round(UNKNOWN_BACKOFF_MS / 60_000)} min`);
-}
-function clearUnknown(path, who) {
-  if (unknownUntil.delete(who)) console.log("[upstream]", path, who, "is registered now — resumed");
-}
+// A moved-off or unregistered device keeps its TCP session open and goes on
+// reporting, which would 404 on every fix. report() backs off on that so the
+// journal is not drowned — see report(). poll() does NOT share that back-off,
+// and that separation is deliberate and safety-critical:
+//
+// poll() is how an immobilise reaches the vehicle. It must try on EVERY cycle.
+// Coupling it to the report back-off meant one stray 404 on a position report
+// silenced command delivery for ten minutes — on an immobiliser, a missed cut
+// is far worse than a repeated log line. So poll never skips; it only throttles
+// its OWN logging (via warn/recovered) when the platform keeps saying it does
+// not know the device. The command still goes out the instant the queue has one
+// and the device is known.
+const reportQuiet = new Map();
+const isReportQuiet = (who) => { const t = reportQuiet.get(who); return t != null && Date.now() < t; };
 
 async function poll(imei, protocol) {
   const who = `${protocol || "?"}:${imei}`;
-  if (isQuiet(who)) return { commands: [], timing: null };
-
   try {
     const { json } = await call({ action: "poll", imei, protocol });
-    clearUnknown("poll", who);
     recovered("poll " + who);
     return { commands: json.commands || [], timing: json.timing || null };
   } catch (e) {
-    if (e.unknownTracker) { markUnknown("poll", who, e.message); return { commands: [], timing: null }; }
+    // Throttled to once a minute by warn(), but never skipped: the next cycle
+    // still asks, so a device registered a moment ago gets its command at once.
     warn("poll " + who, `${e.message} — queued commands cannot be delivered`);
     return { commands: [], timing: null };
   }
