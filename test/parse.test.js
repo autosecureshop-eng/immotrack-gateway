@@ -172,3 +172,41 @@ test("gt06: command-response text is extracted from a 0x15 content block", () =>
   const content = Buffer.concat([Buffer.from([4 + txt.length]), Buffer.from([0, 0, 0, 1]), txt, Buffer.from([0x00, 0x02])]);
   assert.equal(gt.parseResponseText(content), "TIMER OK");
 });
+
+// ---- repointing a device at our own gateway ------------------------------
+// These two commands are what takes a tracker off somebody else's platform.
+// They are also the two that can lose one: a device told to connect to an
+// address that does not answer goes quiet, and the only ways back are an SMS
+// to its SIM or a trip to the vehicle. So the builders validate rather than
+// interpolate, and these pin that.
+
+test("serverText builds the Concox SERVER form", () => {
+  assert.equal(gt.serverText("51.75.20.11", 5023), "SERVER,1,51.75.20.11,5023,0#");
+  assert.equal(gt.serverText("gw.immotrack.co.uk", 5023), "SERVER,1,gw.immotrack.co.uk,5023,0#");
+  assert.equal(gt.serverText("51.75.20.11"), "SERVER,1,51.75.20.11,5023,0#", "port defaults to 5023");
+});
+
+test("serverText refuses a host that would build a broken frame", () => {
+  for (const bad of ["", "   ", null, undefined, "1.2.3.4, 5023", "host name", "a#b", "x".repeat(61)]) {
+    assert.throws(() => gt.serverText(bad, 5023), /bad gateway host/, JSON.stringify(bad));
+  }
+});
+
+test("serverText refuses a port outside 1..65535", () => {
+  for (const bad of [0, -1, 65536, NaN, "abc"]) {
+    assert.throws(() => gt.serverText("1.2.3.4", bad), /bad gateway port/, String(bad));
+  }
+});
+
+test("apnText builds with and without credentials", () => {
+  assert.equal(gt.apnText("everywhere", "eesecure", "secure"), "APN,everywhere,eesecure,secure#");
+  assert.equal(gt.apnText("iot.1nce.net"), "APN,iot.1nce.net,,#", "empty user/pass still keep their commas");
+});
+
+test("apnText refuses values that would break the frame", () => {
+  for (const bad of ["", "  ", null, "two words", "a,b", "a#b"]) {
+    assert.throws(() => gt.apnText(bad), /bad APN/, JSON.stringify(bad));
+  }
+  assert.throws(() => gt.apnText("ok.apn", "two words"), /bad APN user/);
+  assert.throws(() => gt.apnText("ok.apn", "", "a#b"), /bad APN password/);
+});

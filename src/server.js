@@ -47,6 +47,23 @@ function parseTiming(arg) {
   return m ? { on: Number(m[1]), off: Number(m[2]) } : null;
 }
 
+/** "host=1.2.3.4,port=5023" -> { host:"1.2.3.4", port:5023 } */
+function parseServer(arg) {
+  const h = /host=([^,\s]+)/.exec(arg || "");
+  if (!h) return null;
+  const p = /port=(\d+)/.exec(arg || "");
+  return { host: h[1], port: p ? Number(p[1]) : 5023 };
+}
+
+/** "apn=everywhere,user=eesecure,pass=secure" -> { apn, user, pass } */
+function parseApn(arg) {
+  const a = /apn=([^,\s]+)/.exec(arg || "");
+  if (!a) return null;
+  const u = /user=([^,\s]*)/.exec(arg || "");
+  const p = /pass=([^,\s]*)/.exec(arg || "");
+  return { apn: a[1], user: u ? u[1] : "", pass: p ? p[1] : "" };
+}
+
 // ---- apply queued commands to a live session --------------------------------
 
 /**
@@ -87,6 +104,23 @@ async function applyCommands(imei, send, dialect, speed, protocol) {
         // equivalent and falls through to "not supported by this device".
         case "clear_cache": text = dialect.clearCacheText ? dialect.clearCacheText() : null; break;
         case "set_timing": { const t = parseTiming(c.arg); text = t ? dialect.timingText(t.on, t.off) : null; break; }
+        // Move the device onto a different gateway, and set the APN it needs
+        // to get there. These are how a fleet stops belonging to somebody
+        // else's platform — and how one gets lost, if the address is wrong:
+        // the unit obeys, reconnects nowhere, and only an SMS or a visit
+        // brings it back. The dialect validates before anything is sent, and
+        // a bad value throws into the catch below, so the command is acked as
+        // failed and the device is never given a half-formed frame.
+        case "set_server": {
+          const s = parseServer(c.arg);
+          text = s && dialect.serverText ? dialect.serverText(s.host, s.port) : null;
+          break;
+        }
+        case "set_apn": {
+          const a = parseApn(c.arg);
+          text = a && dialect.apnText ? dialect.apnText(a.apn, a.user, a.pass) : null;
+          break;
+        }
         case "live_on": text = dialect.timingText(LIVE_S, LIVE_S); break;
         case "live_off": text = dialect.timingText(timing?.on ?? 20, timing?.off ?? 300); break;
         case "custom": text = String(c.arg || "").trim() || null; break;

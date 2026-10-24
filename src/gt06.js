@@ -192,6 +192,43 @@ function locateText() { return "WHERE#"; }
  */
 function clearCacheText() { return "BACKUP,0#"; }
 
+/**
+ * Point the device at a different server: host and port it should connect to
+ * from now on. Concox/GS900 form is "SERVER,<mode>,<host>,<port>,<domain?>#"
+ * with mode 1 = connect by the address given here.
+ *
+ * This is the command that makes the fleet ours rather than a platform's, and
+ * it is also the one that can lose a tracker: send a host it cannot reach and
+ * the unit goes quiet, with no way back except an SMS to its SIM or a visit to
+ * the vehicle. So the host is validated here rather than trusted — an empty,
+ * spaced or comma-bearing string would otherwise build a malformed frame that
+ * some firmwares accept half of.
+ */
+function serverText(host, port = 5023) {
+  const h = String(host || "").trim();
+  if (!h || /[\s,#]/.test(h) || h.length > 60) throw new Error("bad gateway host: " + JSON.stringify(host));
+  const p = Math.round(Number(port));
+  if (!(p >= 1 && p <= 65535)) throw new Error("bad gateway port: " + port);
+  return `SERVER,1,${h},${p},0#`;
+}
+
+/**
+ * Set the SIM's APN, and its user/password where the network needs them.
+ * Changing this cuts the device's data until the new APN works, so it is sent
+ * before a SERVER change, never after — an unreachable APN is as lost as an
+ * unreachable host.
+ */
+function apnText(apn, user = "", pass = "") {
+  const a = String(apn || "").trim();
+  if (!a || /[\s,#]/.test(a) || a.length > 60) throw new Error("bad APN: " + JSON.stringify(apn));
+  const clean = (s, what) => {
+    const v = String(s || "").trim();
+    if (/[\s,#]/.test(v) || v.length > 32) throw new Error("bad APN " + what + ": " + JSON.stringify(s));
+    return v;
+  };
+  return `APN,${a},${clean(user, "user")},${clean(pass, "password")}#`;
+}
+
 /** ASCII text from a 0x15 / 0x21 command-response content block:
  *  [len:1][server flag:4][text][language:2]; len covers the flag + text. */
 function parseResponseText(content) {
@@ -214,6 +251,7 @@ function parseWhere(text) {
 
 module.exports = {
   nextFrame, parseFrame, parseLogin, parseLocation, parseStatus, parseAlarm, ack, buildCommand,
+  serverText, apnText,
   immobiliseText, timingText, locateText, clearCacheText, parseResponseText, parseWhere,
   LOGIN, GPS, STATUS, GPS_LBS, GPS_LBS_2, ALARM_1, ALARM_2, COMMAND_RESP, COMMAND_RESP_2,
 };
