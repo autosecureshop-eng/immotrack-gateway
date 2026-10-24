@@ -112,19 +112,54 @@ test("a 404 'unknown tracker' does not blame SUPABASE_URL", async () => {
     "the URL is fine — saying otherwise sends people to check a correct setting");
 });
 
-test("poll NEVER backs off — a command must always get its chance", async () => {
-  // Safety-critical: poll is how an immobilise reaches the vehicle, so it must
-  // try on every cycle even for a device the platform keeps 404ing. (The log
-  // is throttled by warn(); the API call itself is not skipped.) The earlier
-  // design backed poll off for ten minutes, which could sit on a real cut.
+// The safety rule, split into its three cases.
+
+test("poll backs off for a device the platform does not know (no command can exist)", async () => {
   const imei = "222222222222222";
   let reached = 0;
+  const hit = async () => { reached++; return { ok:false, status:404, text: async () => JSON.stringify({ error:"unknown tracker" }) }; };
   for (let i = 0; i < 6; i++) {
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = async () => { reached++; return { ok: false, status: 404, text: async () => JSON.stringify({ error: "unknown tracker" }) }; };
+    const realFetch = globalThis.fetch; globalThis.fetch = hit;
     try { await up.poll(imei, "gt06"); } finally { globalThis.fetch = realFetch; }
   }
-  assert.equal(reached, 6, "every poll must reach the API, so a just-registered device is served at once");
+  assert.equal(reached, 1, "after the first 'unknown tracker' it stops asking — the device has no commands anyway");
+});
+
+test("a failed REPORT must never silence command polling (the safety rule)", async () => {
+  const imei = "223344556677889";
+  // A position report 404s (unknown)...
+  await withFetch(404, { error: "unknown tracker" }, () => up.report(imei, { lat:1, lng:2 }, "gt06"));
+  // ...the very next command poll for that same device must STILL reach the API.
+  let reached = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { reached++; return { ok:true, status:200, text: async () => JSON.stringify({ commands:[] }) }; };
+  try { await up.poll(imei, "gt06"); } finally { globalThis.fetch = realFetch; }
+  assert.equal(reached, 1, "a report failure must not back off poll — a cut can't wait on a reporting hiccup");
+});
+
+test("a non-404 poll error keeps retrying (could be a known device, real command)", async () => {
+  const imei = "225555555555555";
+  let reached = 0;
+  const hit = async () => { reached++; return { ok:false, status:500, text: async () => "boom" }; };
+  for (let i = 0; i < 4; i++) {
+    const realFetch = globalThis.fetch; globalThis.fetch = hit;
+    try { await up.poll(imei, "gt06"); } finally { globalThis.fetch = realFetch; }
+  }
+  assert.equal(reached, 4, "a 500 is not 'unknown' — never skip it, a real command may be waiting");
+});
+
+test("a good report resumes polling for a device that had backed off", async () => {
+  const imei = "226666666666666";
+  // poll 404s → backs off
+  await withFetch(404, { error:"unknown tracker" }, () => up.poll(imei, "gt06"));
+  // a successful report proves it's known → clears the poll back-off
+  await withFetch(200, { ok:true }, () => up.report(imei, { lat:1, lng:2 }, "gt06"));
+  // next poll reaches the API again
+  let reached = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { reached++; return { ok:true, status:200, text: async () => JSON.stringify({ commands:[] }) }; };
+  try { await up.poll(imei, "gt06"); } finally { globalThis.fetch = realFetch; }
+  assert.equal(reached, 1, "a reporting device is never stuck not polling");
 });
 
 test("one device's failure does not reset another's throttle", async () => {

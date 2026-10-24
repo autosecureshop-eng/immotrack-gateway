@@ -147,6 +147,9 @@ async function report(imei, pos, protocol) {
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
     if (reportQuiet.delete(who)) console.log("[upstream]", "report", who, "is registered now — resumed");
+    // A good report proves the device is known, so let command polling resume at
+    // once rather than waiting out its own back-off window.
+    pollQuiet.delete(who);
     recovered("report " + who);
     return true;
   } catch (e) {
@@ -169,30 +172,47 @@ async function report(imei, pos, protocol) {
  * caller cannot tell the difference. That is exactly the bug this file used to
  * have, and it is why the failure is logged loudly here instead.
  */
-// A moved-off or unregistered device keeps its TCP session open and goes on
-// reporting, which would 404 on every fix. report() backs off on that so the
-// journal is not drowned — see report(). poll() does NOT share that back-off,
-// and that separation is deliberate and safety-critical:
+// Two back-offs, kept strictly apart, and the separation is the safety rule.
 //
-// poll() is how an immobilise reaches the vehicle. It must try on EVERY cycle.
-// Coupling it to the report back-off meant one stray 404 on a position report
-// silenced command delivery for ten minutes — on an immobiliser, a missed cut
-// is far worse than a repeated log line. So poll never skips; it only throttles
-// its OWN logging (via warn/recovered) when the platform keeps saying it does
-// not know the device. The command still goes out the instant the queue has one
-// and the device is known.
+// reportQuiet: a device the platform does not know keeps reporting, which 404s
+// on every fix; report() stops bothering for a while.
+//
+// pollQuiet: poll backs off ONLY when the platform itself says it does not know
+// the device ("unknown tracker" 404). Such a device CANNOT have a command queued
+// for it, so skipping loses nothing — and it is how a tracker pointed here but
+// living on another platform stops costing a call every couple of seconds.
+//
+// What must never happen: a failed position REPORT silencing command polling. A
+// report hiccup on a known vehicle must not delay a cut. So a report failure
+// sets reportQuiet only, never pollQuiet. And because a successful report proves
+// the device IS known, it clears pollQuiet at once — so a vehicle that is
+// reporting can never be stuck not polling. A registered device never 404s on
+// poll in the first place; only a genuinely unknown one backs off, and it
+// resumes the moment it becomes known (its first good poll or report).
 const reportQuiet = new Map();
+const pollQuiet = new Map();
 const isReportQuiet = (who) => { const t = reportQuiet.get(who); return t != null && Date.now() < t; };
 
 async function poll(imei, protocol) {
   const who = `${protocol || "?"}:${imei}`;
+  const until = pollQuiet.get(who);
+  if (until != null && Date.now() < until) return { commands: [], timing: null };
   try {
     const { json } = await call({ action: "poll", imei, protocol });
+    if (pollQuiet.delete(who)) console.log("[upstream]", "poll", who, "is known now — polling resumed");
     recovered("poll " + who);
     return { commands: json.commands || [], timing: json.timing || null };
   } catch (e) {
-    // Throttled to once a minute by warn(), but never skipped: the next cycle
-    // still asks, so a device registered a moment ago gets its command at once.
+    if (e.unknownTracker) {
+      // No command can exist for a device the platform does not know, so this
+      // is safe to skip — unlike any other error, which keeps retrying.
+      pollQuiet.set(who, Date.now() + UNKNOWN_BACKOFF_MS);
+      console.error("[upstream]", "poll", who, e.message,
+        `— unknown device has no commands; not asking again for ${Math.round(UNKNOWN_BACKOFF_MS / 60_000)} min`);
+      return { commands: [], timing: null };
+    }
+    // Any OTHER failure (auth, 5xx, network) is NOT skipped: it could be a known
+    // device and a real command, so the next cycle still asks.
     warn("poll " + who, `${e.message} — queued commands cannot be delivered`);
     return { commands: [], timing: null };
   }
