@@ -90,8 +90,54 @@ test("recovery is logged once the API works again", async () => {
   // `ack` is already in the failing state from the test above.
   const { logs } = await withFetch(200, { ok: true },
     () => up.ack("123456789012345", 42, true, "sent"));
-  assert.ok(logs.some((l) => /ack recovered/.test(l)),
-    "the journal should show when it started working again");
+  assert.ok(logs.some((l) => /ack \S+ recovered/.test(l)),
+    "the journal should show when it started working again, and for which device");
+});
+
+// ---- one bad device must not drown the journal ---------------------------
+// Live symptom: a tracker moved off the account kept its TCP session open, so
+// the 5s queue poll asked about it 12 times a minute forever. Worse, a healthy
+// tracker's success cleared the shared failure state, so the throttle never
+// engaged — the journal filled with alternating "failed"/"recovered after 1
+// failures over 0s" pairs and real faults were lost in it.
+
+test("a 404 'unknown tracker' does not blame SUPABASE_URL", async () => {
+  const { errors } = await withFetch(
+    404, { error: "unknown tracker" },
+    () => up.poll("111111111111111", "gt06"),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not registered, or not active/);
+  assert.ok(!/SUPABASE_URL/.test(errors[0]),
+    "the URL is fine — saying otherwise sends people to check a correct setting");
+});
+
+test("an unknown tracker is asked about once, then left alone", async () => {
+  const imei = "222222222222222";
+  const first = await withFetch(404, { error: "unknown tracker" },
+    () => up.poll(imei, "gt06"));
+  assert.equal(first.errors.length, 1, "say it once");
+  assert.match(first.errors[0], /not asking again/);
+
+  // Every later poll inside the back-off window must be silent, and must not
+  // even reach the API.
+  let calls = 0;
+  for (let i = 0; i < 5; i++) {
+    const again = await withFetch(404, { error: "unknown tracker" },
+      () => up.poll(imei, "gt06"));
+    calls += again.errors.length;
+  }
+  assert.equal(calls, 0, "no further noise while it stays unregistered");
+});
+
+test("one device's failure does not reset another's throttle", async () => {
+  // The bad one fails...
+  await withFetch(500, "boom", () => up.poll("333333333333333", "gt06"));
+  // ...the good one succeeds. That must NOT log a recovery for the bad one.
+  const { logs } = await withFetch(200, { commands: [] },
+    () => up.poll("444444444444444", "gt06"));
+  assert.ok(!logs.some((l) => /333333333333333.*recovered/.test(l)),
+    "a healthy tracker must not 'recover' a broken one");
 });
 
 test("checkConfig names every missing setting", () => {

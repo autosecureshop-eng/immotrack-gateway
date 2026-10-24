@@ -22,13 +22,31 @@ const GATEWAY_KEY = process.env.TRACKER_GATEWAY_KEY;
 
 const WARN_EVERY_MS = 60_000;
 
-/** What a status code almost always means here, in the fitter's terms. */
-function explain(status) {
+// How long to leave an IMEI alone after the API says it does not know it. A
+// device that has been moved to another account, or never registered, keeps
+// its TCP session open and would otherwise be polled every COMMAND_POLL_S for
+// as long as it stays plugged in — 12 pointless round trips a minute, each
+// one an error line that buries the real ones.
+const UNKNOWN_BACKOFF_MS = Number(process.env.UNKNOWN_BACKOFF_MS || 600_000);
+
+/**
+ * What a status code almost always means here, in the fitter's terms.
+ *
+ * The body matters as much as the code: a 404 from the function means "I do
+ * not know this tracker", while a 404 from the host means the URL is wrong.
+ * Saying "check SUPABASE_URL" for the first one sends people to inspect a
+ * setting that is correct, which is worse than saying nothing.
+ */
+function explain(status, body = "") {
   if (status === 401 || status === 403) {
     return `rejected (${status}) — TRACKER_GATEWAY_KEY in .env must equal the ` +
            "tracker function's secret of the same name";
   }
-  if (status === 404) return `not found (404) — check SUPABASE_URL`;
+  if (status === 404) {
+    return /unknown tracker/i.test(body)
+      ? "unknown tracker (404) — this IMEI is not registered, or not active, on the platform"
+      : "not found (404) — check SUPABASE_URL";
+  }
   if (status >= 500) return `tracker API error (${status})`;
   return `HTTP ${status}`;
 }
@@ -36,6 +54,12 @@ function explain(status) {
 // A failing call usually fails on every packet, so the first one is logged at
 // once and the rest are folded into a count once a minute. Recovery is logged
 // too, so the journal shows when it started working again.
+//
+// The key is per call AND per device, not per call alone. With one key per
+// call a healthy tracker's success cleared the failure state of a broken one
+// sharing the gateway, so every cycle printed a fresh warning and a fresh
+// "recovered" — the throttle never engaged and the journal filled with
+// alternating pairs that said nothing.
 const failing = new Map();
 
 function warn(key, msg) {
@@ -76,8 +100,9 @@ async function call(body) {
   let json = {};
   try { json = JSON.parse(text); } catch { /* non-JSON */ }
   if (!res.ok) {
-    const err = new Error(explain(res.status) + (text ? ` — ${text.slice(0, 200)}` : ""));
+    const err = new Error(explain(res.status, text) + (text ? ` — ${text.slice(0, 200)}` : ""));
     err.status = res.status;
+    err.unknownTracker = res.status === 404 && /unknown tracker/i.test(text);
     throw err;
   }
   return { status: res.status, json };
@@ -96,8 +121,8 @@ async function report(imei, pos, protocol) {
       ext_power: pos.extPower, alarm: pos.alarm,
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
-    recovered("report");
-  } catch (e) { warn("report", `${protocol || "?"}:${imei}: ${e.message}`); }
+    recovered(`report ${protocol || "?"}:${imei}`);
+  } catch (e) { warn(`report ${protocol || "?"}:${imei}`, e.message); }
 }
 
 /**
@@ -108,13 +133,32 @@ async function report(imei, pos, protocol) {
  * caller cannot tell the difference. That is exactly the bug this file used to
  * have, and it is why the failure is logged loudly here instead.
  */
+// IMEIs the API has disowned, and when it is worth asking about them again.
+const unknownUntil = new Map();
+
 async function poll(imei, protocol) {
+  const who = `${protocol || "?"}:${imei}`;
+  const quiet = unknownUntil.get(who);
+  if (quiet && Date.now() < quiet) return { commands: [], timing: null };
+
   try {
     const { json } = await call({ action: "poll", imei, protocol });
-    recovered("poll");
+    if (unknownUntil.delete(who)) {
+      console.log("[upstream]", "poll", who, "is registered now — polling resumed");
+    }
+    recovered("poll " + who);
     return { commands: json.commands || [], timing: json.timing || null };
   } catch (e) {
-    warn("poll", `${protocol || "?"}:${imei}: ${e.message} — queued commands cannot be delivered`);
+    if (e.unknownTracker) {
+      // Not a fault to retry hard: nothing on this gateway can fix it, and
+      // only registering the IMEI on the platform will. Say so once, then go
+      // quiet rather than filling the journal for as long as it stays plugged in.
+      unknownUntil.set(who, Date.now() + UNKNOWN_BACKOFF_MS);
+      console.error("[upstream]", "poll", who, e.message,
+        `— not asking again for ${Math.round(UNKNOWN_BACKOFF_MS / 60_000)} min`);
+      return { commands: [], timing: null };
+    }
+    warn("poll " + who, `${e.message} — queued commands cannot be delivered`);
     return { commands: [], timing: null };
   }
 }
@@ -123,8 +167,8 @@ async function poll(imei, protocol) {
 async function ack(imei, commandId, ok, result, protocol) {
   try {
     await call({ action: "ack", imei, command_id: commandId, ok, result, protocol });
-    recovered("ack");
-  } catch (e) { warn("ack", `${protocol || "?"}:${imei}: ${e.message}`); }
+    recovered(`ack ${protocol || "?"}:${imei}`);
+  } catch (e) { warn(`ack ${protocol || "?"}:${imei}`, e.message); }
 }
 
 /**
