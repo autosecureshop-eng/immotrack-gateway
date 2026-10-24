@@ -115,14 +115,34 @@ async function report(imei, pos, protocol) {
       action: "report", imei, protocol,
       lat: pos.lat, lng: pos.lng, speed: pos.speed,
       heading: pos.heading, battery: pos.battery,
-      ignition: pos.ignition, voltage: pos.voltage, odometer_km: pos.odometerKm,
+      ignition: pos.ignition, voltage: pos.voltage,
+      // The device's OWN total, where it has one. A Teltonika reports IO 16
+      // (total odometer) and that is authoritative — the platform stores it
+      // as given. A GT06 has no odometer at all, so this is absent for them
+      // and `trip_km` below carries the distance instead.
+      odometer_km: pos.odometerKm,
+      // Distance SINCE THE LAST REPORT, not a running total.
+      //
+      // The gateway used to send its own absolute figure, which made the
+      // gateway the owner of the number. It counts in memory, so every
+      // restart began again at zero and the next report overwrote the stored
+      // mileage with a few hundred metres — mileage silently walked backwards
+      // whenever the service was updated. It also meant the platform could
+      // not set a starting figure or clear one for an off-hire vehicle,
+      // because the next report would simply overwrite it.
+      //
+      // The platform owns the total and adds this to it. A restart loses at
+      // most the distance since the last report, and anything the operator
+      // sets stays set.
+      trip_km: pos.tripKm,
       gsm: pos.gsm, sats: pos.satellites,
       // external 12 V feed connected (true/false/undefined) + one-shot alarm
       ext_power: pos.extPower, alarm: pos.alarm,
       fix_at: pos.time ? new Date(pos.time).toISOString() : undefined,
     });
     recovered(`report ${protocol || "?"}:${imei}`);
-  } catch (e) { warn(`report ${protocol || "?"}:${imei}`, e.message); }
+    return true;
+  } catch (e) { warn(`report ${protocol || "?"}:${imei}`, e.message); return false; }
 }
 
 /**

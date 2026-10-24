@@ -149,3 +149,34 @@ test("checkConfig names every missing setting", () => {
   process.env.SUPABASE_URL = saved;
   assert.deepEqual(up.checkConfig(), []);
 });
+
+// ---- mileage: the platform owns the total, we hand over slices ------------
+// The gateway used to send its own running total. It counts in memory, so a
+// restart began at zero and the next report overwrote the stored mileage with
+// a few hundred metres — mileage walked backwards on every deploy.
+
+test("report sends trip_km, and a device's own odometer when it has one", async () => {
+  let seen;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_u, o) => { seen = JSON.parse(o.body);
+    return { ok: true, status: 200, text: async () => "{}" }; };
+  try {
+    await up.report("123456789012345", { lat: 1, lng: 2, tripKm: 0.42 }, "gt06");
+    assert.equal(seen.trip_km, 0.42, "the slice since the last report");
+    assert.equal(seen.odometer_km, undefined, "a GT06 has no odometer of its own");
+
+    await up.report("123456789012345", { lat: 1, lng: 2, odometerKm: 84500 }, "teltonika");
+    assert.equal(seen.odometer_km, 84500, "a Teltonika's own total is passed through");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("report says whether it landed, so distance is not thrown away", async () => {
+  const ok = await withFetch(200, { ok: true },
+    () => up.report("123456789012345", { lat: 1, lng: 2, tripKm: 1 }, "gt06"));
+  assert.equal(ok.result, true, "a stored report must report success");
+
+  const bad = await withFetch(500, "boom",
+    () => up.report("123456789012345", { lat: 1, lng: 2, tripKm: 1 }, "gt06"));
+  assert.equal(bad.result, false,
+    "a failed report must say so — the caller keeps the km for the next attempt");
+});

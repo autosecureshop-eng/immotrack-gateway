@@ -323,7 +323,19 @@ net.createServer((sock) => {
   // also has no odometer, so distance is integrated here from the fixes.
   let status = {};
   let prevFix = null;
-  let odometerKm = null;
+  // Distance measured but not yet accepted by the platform. Every fix adds to
+  // it; a report that the platform acknowledges clears it. A report that FAILS
+  // leaves it, so the kilometres are carried into the next attempt instead of
+  // being thrown away — the platform keeps the total, we only have to hand
+  // over each slice exactly once.
+  let pendingKm = 0;
+  const tripNow = () => (pendingKm > 0 ? Math.round(pendingKm * 1000) / 1000 : undefined);
+  /** Report, and only forget the distance if it actually landed. */
+  const sendReport = async (body) => {
+    const slice = pendingKm;
+    const ok = await up.report(imei, { ...body, tripKm: tripNow() }, "gt06");
+    if (ok) pendingKm = Math.max(0, pendingKm - slice);
+  };
   // Real supply voltage: GT06-family status frames only carry a backup-battery
   // level, so we ask the unit (GS900 "POWERLEVEL#" -> "POWERLEVEL_OK:11.80V") on
   // login and every 5 min while idle. Units that don't know the command just
@@ -366,7 +378,7 @@ net.createServer((sock) => {
           // odometer over so its first heartbeats (before a new GPS fix) still
           // reach the platform — power/ignition changes show straight away.
           const saved = lastByImei.get(deviceKey("gt06", imei));
-          if (saved && !prevFix) { prevFix = { ...saved.fix, speed: 0 }; odometerKm = saved.odo; }
+          if (saved && !prevFix) { prevFix = { ...saved.fix, speed: 0 }; pendingKm += saved.pendingKm || 0; }
         } else if (protocol === gt.GPS_LBS_2 || protocol === gt.ALARM_1 || protocol === gt.ALARM_2) {
           // Alarm packet: position + status + the alarm that caused it (power
           // cut, vibration, SOS…). Forward the alarm once; keep the status bits.
@@ -380,11 +392,11 @@ net.createServer((sock) => {
             if (alarm) log("gt06 alarm", imei, alarm, "ext=" + st.extPower);
             if (lat || lng) {
               lastSpeed = speed; lastSpeedAt = Date.now();
-              if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
+              if (prevFix) pendingKm += haversineKm(prevFix, pos);
               prevFix = pos;
             }
             // Even with no fix at all the alarm still goes up (status-only report).
-            await up.report(imei, { ...(pos || {}), ...status, alarm, odometerKm: odometerKm ?? undefined, time: (lat || lng) ? time : Date.now() }, "gt06");
+            await sendReport({ ...(pos || {}), ...status, alarm, time: (lat || lng) ? time : Date.now() });
             pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.GPS || protocol === gt.GPS_LBS) {
@@ -393,9 +405,9 @@ net.createServer((sock) => {
             const pos = gt.parseLocation(content);
             if (pos.lat || pos.lng) {
               lastSpeed = pos.speed; lastSpeedAt = Date.now();
-              if (prevFix) odometerKm = (odometerKm ?? 0) + haversineKm(prevFix, pos);
+              if (prevFix) pendingKm += haversineKm(prevFix, pos);
               prevFix = pos;
-              await up.report(imei, { ...pos, ...status, odometerKm: odometerKm ?? undefined }, "gt06");
+              await sendReport({ ...pos, ...status });
             }
             pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
           }
@@ -416,7 +428,7 @@ net.createServer((sock) => {
             if (hbAlarm) log("gt06 status alarm", imei, hbAlarm);
             // No fix yet on this connection: send status only — the platform
             // pins it to the vehicle's last known position.
-            await up.report(imei, { ...(prevFix || {}), ...status, alarm: hbAlarm, odometerKm: odometerKm ?? undefined, time: Date.now() }, "gt06");
+            await sendReport({ ...(prevFix || {}), ...status, alarm: hbAlarm, time: Date.now() });
             pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
           }
         } else if (protocol === gt.COMMAND_RESP || protocol === gt.COMMAND_RESP_2) {
@@ -426,7 +438,7 @@ net.createServer((sock) => {
           if (mv) {
             realVolt = parseFloat(mv[1]); realVoltAt = Date.now(); status.voltage = realVolt;
             log("gt06 voltage", imei, realVolt + "V");
-            if (imei) await up.report(imei, { ...(prevFix || {}), ...status, odometerKm: odometerKm ?? undefined, time: Date.now() }, "gt06");
+            if (imei) await sendReport({ ...(prevFix || {}), ...status, time: Date.now() });
           }
           if (imei && (!mv || pending)) pending = await handleReply(imei, pending, text, gt.parseWhere, "gt06");
         } else {
@@ -434,7 +446,7 @@ net.createServer((sock) => {
           sock.write(gt.ack(protocol, serial));
           if (imei) pending = (await flushDevice("gt06", imei, sendCmd, gt, speedNow())) || pending;
         }
-        if (imei && prevFix) lastByImei.set(deviceKey("gt06", imei), { fix: prevFix, odo: odometerKm });
+        if (imei && prevFix) lastByImei.set(deviceKey("gt06", imei), { fix: prevFix, pendingKm });
       }
     } catch (e) {
       log("gt06 error", imei, e.message);
