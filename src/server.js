@@ -162,7 +162,14 @@ async function applyCommands(imei, send, dialect, speed, protocol) {
 const sessions = new Map();
 const inFlight = new Set(); // guards against a timer tick racing a packet
 
-const COMMAND_POLL_S = Number(process.env.COMMAND_POLL_S || 5);
+// How often, in seconds, the gateway asks the platform for queued commands
+// while a device is connected. This is the worst-case lag between pressing a
+// button and the vehicle acting, so it is kept low — but every connected
+// device polls on this clock, so it is also the main cost driver against the
+// platform. 2s is a human-instant feel at a sane call rate; push delivery (a
+// poke the moment a command is queued) is the way to get true zero-lag without
+// polling faster. Tunable with COMMAND_POLL_S.
+const COMMAND_POLL_S = Number(process.env.COMMAND_POLL_S || 2);
 
 /** The key for one physical tracker. */
 const deviceKey = (protocol, imei) => `${protocol}:${imei}`;
